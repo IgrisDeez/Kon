@@ -1,0 +1,42 @@
+{
+  "name": "powers_manual_reroll_ambiguous_auto_resume",
+  "entrypoint": "manual_reroll_flow",
+  "roll_domain": "powers",
+  "reason": "bad power colossus",
+  "baseline": "colossus 20.0 bossdmg.damage21.2 .critchance1.6 . luck10.2 .hp30.0 .critdamage5.3",
+  "trait": "colossus",
+  "auto_states": [
+    { "state": "unknown", "profile": "ambiguous" },
+    { "state": "unknown", "profile": "ambiguous" },
+    { "state": "unknown", "profile": "ambiguous" }
+  ],
+  "popup_states": [false, false, false],
+  "banner_states": [false],
+  "stats_sequence": [
+    {
+      "context": "Manual Reroll Auto Resume Recovery verify",
+      "changed": true,
+      "text": "current power empowered hp4.4 .damage6.1",
+      "state": "rolling",
+      "reason": "popup_confirmed_mid_polling",
+      "details": {
+        "signal_sources": ["ocr", "popup"],
+        "image_changed_samples": 0,
+        "max_change_score": 0.0
+      }
+    }
+  ],
+  "expected": {
+    "result": true,
+    "snapshot_type": "recovery",
+    "snapshot": {
+      "result": "confirmed",
+      "route_reason": "manual_reroll_bounded_auto_reenable_confirmed",
+      "auto_state": "uncertain",
+      "rolling_confirmed": true,
+      "failure_type": "none",
+      "support_signals": ["bounded_auto_reenable"]
+    },
+    "click_labels": ["Manual Reroll", "Confirm Reroll", "Manual Reroll Auto Resume Recovery Auto Re-enable"]
+  }
+}

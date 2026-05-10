@@ -1,0 +1,57 @@
+{
+  "name": "powers_startup_non_target_auto_disabled",
+  "entrypoint": "start_or_recover",
+  "roll_domain": "powers",
+  "label": "Initial Auto Start",
+  "baseline": "fierce hp3.1 .damage4.7",
+  "startup_context": {
+    "current_spec_class": "NON_TARGET filler",
+    "preflight_fallback_reason": "stat_numbers_changed"
+  },
+  "auto_states": [
+    { "state": "disabled", "profile": "strong_disabled" },
+    { "state": "enabled", "profile": "strong_enabled" }
+  ],
+  "popup_states": [false, false],
+  "banner_states": [false],
+  "stats_sequence": [
+    {
+      "context": "Initial Auto Start preflight rolling check",
+      "changed": false,
+      "text": "fierce hp3.1 .damage4.7",
+      "state": "not_rolling",
+      "reason": "no_material_change",
+      "details": {
+        "signal_sources": [],
+        "image_changed_samples": 0,
+        "max_change_score": 0.0
+      }
+    },
+    {
+      "context": "Initial Auto Start auto verify",
+      "changed": true,
+      "text": "tempered hp4.7 .damage4.5",
+      "state": "rolling",
+      "reason": "popup_confirmed_mid_polling",
+      "details": {
+        "signal_sources": ["ocr", "popup"],
+        "image_changed_samples": 0,
+        "max_change_score": 0.0
+      }
+    }
+  ],
+  "expected": {
+    "result": true,
+    "snapshot_type": "startup",
+    "snapshot": {
+      "result": "confirmed_rolling",
+      "route": "none",
+      "route_reason": "none",
+      "auto_state": "disabled_clicked",
+      "rolling_confirmed": true,
+      "failure_type": "none",
+      "support_signals": []
+    },
+    "click_labels": ["Initial Auto Start Compact Startup Enable"]
+  }
+}

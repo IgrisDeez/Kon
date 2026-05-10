@@ -1,0 +1,70 @@
+{
+  "name": "powers_startup_non_target_auto_unknown",
+  "entrypoint": "start_or_recover",
+  "roll_domain": "powers",
+  "label": "Initial Auto Start",
+  "baseline": "empowered hp4.4 .damage6.1",
+  "startup_context": {
+    "current_spec_class": "NON_TARGET filler",
+    "preflight_fallback_reason": "stat_numbers_changed"
+  },
+  "auto_states": [
+    { "state": "unknown", "profile": "ambiguous" },
+    { "state": "unknown", "profile": "ambiguous" },
+    { "state": "disabled", "profile": "strong_disabled" }
+  ],
+  "popup_states": [false, false],
+  "banner_states": [false],
+  "stats_sequence": [
+    {
+      "context": "Initial Auto Start preflight rolling check",
+      "changed": false,
+      "text": "empowered hp4.4 .damage6.1",
+      "state": "not_rolling",
+      "reason": "no_material_change",
+      "details": {
+        "signal_sources": [],
+        "image_changed_samples": 0,
+        "max_change_score": 0.0
+      }
+    },
+    {
+      "context": "Initial Auto Start Compact Startup Recovery ambiguous checkbox guard",
+      "changed": false,
+      "text": "empowered hp4.4 .damage6.1",
+      "state": "not_rolling",
+      "reason": "no_material_change",
+      "details": {
+        "signal_sources": [],
+        "image_changed_samples": 0,
+        "max_change_score": 0.0
+      }
+    },
+    {
+      "context": "Initial Auto Start Compact Startup Recovery verify",
+      "changed": true,
+      "text": "tempered hp4.7 .damage4.5",
+      "state": "rolling",
+      "reason": "popup_confirmed_mid_polling",
+      "details": {
+        "signal_sources": ["ocr", "popup"],
+        "image_changed_samples": 0,
+        "max_change_score": 0.0
+      }
+    }
+  ],
+  "expected": {
+    "result": true,
+    "snapshot_type": "startup",
+    "snapshot": {
+      "result": "confirmed_rolling",
+      "route": "continue",
+      "route_reason": "compact_unknown_guarded_recovery_confirmed",
+      "auto_state": "unknown_guarded_path",
+      "rolling_confirmed": true,
+      "failure_type": "none",
+      "support_signals": ["compact_preflight", "bounded_guarded_recovery"]
+    },
+    "click_labels": ["Initial Auto Start Compact Startup Recovery Auto Re-enable"]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "watchdog_maintenance_screen_skips_recovery",
+  "entrypoint": "unexpected_not_rolling_watchdog",
+  "roll_domain": "powers",
+  "current_text": "glientinitiated disconnects erron ode 285 maintenance starting in 23s",
+  "state": "NON_TARGET",
+  "trait": "colossus",
+  "idle_for": 10.0,
+  "allow_early": true,
+  "popup_states": [],
+  "banner_states": [],
+  "auto_states": [],
+  "stats_sequence": [],
+  "expected": {
+    "result": "skipped",
+    "snapshot_type": "recovery",
+    "snapshot": {
+      "result": "skipped",
+      "route_reason": "maintenance_screen",
+      "auto_state": "not_checked",
+      "rolling_confirmed": false,
+      "failure_type": "maintenance_screen",
+      "support_signals": ["session_blocked", "maintenance_screen"]
+    },
+    "click_labels": []
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "watchdog_disconnect_screen_skips_recovery",
+  "entrypoint": "unexpected_not_rolling_watchdog",
+  "roll_domain": "powers",
+  "current_text": "clientinitiateddisconnect. errorcode 285 clientinitiateddisconnect. errorcode 285",
+  "state": "NON_TARGET",
+  "trait": "colossus",
+  "idle_for": 10.0,
+  "allow_early": true,
+  "popup_states": [],
+  "banner_states": [],
+  "auto_states": [],
+  "stats_sequence": [],
+  "expected": {
+    "result": "skipped",
+    "snapshot_type": "recovery",
+    "snapshot": {
+      "result": "skipped",
+      "route_reason": "disconnect_screen",
+      "auto_state": "not_checked",
+      "rolling_confirmed": false,
+      "failure_type": "disconnect_screen",
+      "support_signals": ["session_blocked", "disconnect_screen"]
+    },
+    "click_labels": []
+  }
+}

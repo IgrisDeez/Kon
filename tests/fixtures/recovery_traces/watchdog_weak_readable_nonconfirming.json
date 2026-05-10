@@ -1,0 +1,55 @@
+{
+  "name": "watchdog_weak_readable_nonconfirming",
+  "entrypoint": "unexpected_not_rolling_watchdog",
+  "roll_domain": "powers",
+  "current_text": "colossus 20.0 bossdmg.damage21.2 .critchance1.6 . luck10.2 .hp30.0 .critdamage5.3",
+  "state": "NON_TARGET",
+  "trait": "colossus",
+  "idle_for": 10.0,
+  "allow_early": true,
+  "popup_states": [false],
+  "banner_states": [false],
+  "auto_states": [
+    { "state": "unknown", "profile": "ambiguous" },
+    { "state": "disabled", "profile": "strong_disabled" }
+  ],
+  "stats_sequence": [
+    {
+      "context": "Unexpected No-Roll Watchdog ambiguous checkbox confirm",
+      "changed": true,
+      "text": "rampage hp4.1 .damage2.4",
+      "state": "rolling",
+      "reason": "trait_changed:rampage",
+      "details": {
+        "signal_sources": ["ocr"],
+        "image_changed_samples": 0,
+        "max_change_score": 0.0
+      }
+    },
+    {
+      "context": "Unexpected No-Roll Watchdog verify",
+      "changed": false,
+      "text": "colossus 20.0 bossdmg.damage21.2 .critchance1.6 . luck10.2 .hp30.0 .critdamage5.3",
+      "state": "not_rolling",
+      "reason": "no_material_change",
+      "details": {
+        "signal_sources": [],
+        "image_changed_samples": 0,
+        "max_change_score": 0.0
+      }
+    }
+  ],
+  "expected": {
+    "result": "failed",
+    "snapshot_type": "recovery",
+    "snapshot": {
+      "result": "failed",
+      "route_reason": "watchdog_auto_reenable_failed",
+      "auto_state": "disabled",
+      "rolling_confirmed": false,
+      "failure_type": "watchdog_auto_reenable_failed",
+      "support_signals": ["watchdog_auto_reenable"]
+    },
+    "click_labels": ["Unexpected No-Roll Watchdog Auto Re-enable"]
+  }
+}
