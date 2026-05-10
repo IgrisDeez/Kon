@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.100.11
+
+- Restored unsupported/non-target Power handling so non-mythic or unsupported rolls remain Auto-roll filler instead of manual reroll targets.
+- Routed supported BAD Powers found in startup verification samples into the existing stable BAD confirmation and manual reroll flow.
+- Added regressions for unsupported Power filler behavior and sampled supported BAD Power startup reroll routing.
+
 ## v1.100.10
 
 - Routed clear unsupported or non-target Powers such as Battleborn/Berserker into manual reroll instead of treating them as Auto-roll filler.

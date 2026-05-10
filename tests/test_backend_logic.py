@@ -2192,7 +2192,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertLess(summary_idx, passive_force_idx)
         self.assertLess(summary_idx, power_force_idx)
 
-    def test_unsupported_power_routes_to_manual_reroll_required(self):
+    def test_unsupported_power_non_target_does_not_enter_manual_reroll(self):
         bot = StubBot(
             [
                 (
@@ -2203,28 +2203,61 @@ class BackendLogicTests(unittest.TestCase):
             ]
         )
         bot.set_roll_domain("powers")
+        bot.manual_reroll_flow = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unsupported/filler powers should not enter manual reroll")
+        )
 
         state, trait, summary, _text, missing, near = bot.check_roll()
 
-        self.assertEqual(state, "DISABLED")
+        self.assertEqual(state, "NON_TARGET")
         self.assertEqual(trait, "non_target_power")
-        self.assertIn("manual reroll required", summary)
-        self.assertEqual(missing, ["Unsupported power"])
+        self.assertIn("Unsupported or filler power observed", summary)
+        self.assertEqual(missing, ["Non-target power"])
         self.assertFalse(near)
 
-    def test_powers_startup_unsupported_current_power_manual_rerolls(self):
+    def test_powers_startup_verify_sample_bad_power_manual_rerolls(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
         bot.set_roll_domain("powers")
+        self.apply_subjugator_luck_target(bot)
         bot.cfg["OCR_DEBUG_FILE"] = False
-        bot.check_roll = lambda *args, **kwargs: (
-            "DISABLED",
-            "non_target_power",
-            "Unsupported or non-target Power observed; manual reroll required",
-            "Battleborn HP 7.1 Damage 5.7",
-            ["Unsupported power"],
-            False,
-        )
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot._begin_startup_context("unit test")
+        bot._startup_context["current_spec_class"] = "NON_TARGET filler"
+        bot._startup_context["preflight_fallback_reason"] = "manual_probe_required"
+        bot.ocr_region = lambda *_args, **_kwargs: "battleborn hp7.1 damage5.7"
+        bot.popup_active = lambda *_args, **_kwargs: False
+        bot._observe_auto_state = lambda *_args, **_kwargs: "unknown"
+        bot.auto_checkbox_state = lambda: "unknown"
+        bot.click = lambda *_args, **_kwargs: None
+        bad_text = "Subjugator NPC Slow 20% 5s Damage 36.8 Crit Chance 2.8 Luck 9.4 HP 34.4 Crit Damage 10.2"
+
+        def fake_stats_changed(_baseline, context="", **_kwargs):
+            bot.last_recovery_verify_state = "not_rolling"
+            bot.last_recovery_verify_details = {
+                "classification": "not_rolling",
+                "rejection_reason": "readable_insufficient_change",
+                "reason": "readable_insufficient_change",
+                "signal_sources": ["ocr", "image_change"],
+                "image_changed_samples": 1,
+                "max_change_score": 7.0,
+                "samples_detail": [
+                    {
+                        "cleaned": bad_text,
+                        "unreliable": False,
+                        "materially_different": True,
+                        "trait_only": False,
+                        "image_changed": True,
+                    }
+                ],
+            }
+            bot.last_recovery_reason = "readable_insufficient_change"
+            bot.last_recovery_verify_unreadable = False
+            return False, _baseline
+
+        bot.stats_changed = fake_stats_changed
+        bot.check_roll = lambda allow_fallback=True, startup_fast=False: self.evaluate_power_text(bot, bad_text, "confirm")
         manual_calls = []
 
         def manual_reroll(reason=""):
@@ -2234,9 +2267,9 @@ class BackendLogicTests(unittest.TestCase):
 
         bot.manual_reroll_flow = manual_reroll
 
-        self.assertEqual(bot.startup_check_current_roll(), "rerolled")
-        self.assertEqual(manual_calls, ["startup current disabled non_target_power"])
-        self.assertTrue(any("manual rerolling immediately" in message for message in messages))
+        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(manual_calls, ["initial auto start current bad subjugator"])
+        self.assertTrue(any("Startup verification saw supported BAD Power" in message for message in messages))
 
     def test_startup_high_value_current_spec_stops_as_before(self):
         messages = []

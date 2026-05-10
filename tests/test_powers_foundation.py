@@ -313,7 +313,7 @@ class PowersFoundationTests(unittest.TestCase):
         self.assertTrue(any("NPC increased damage" in item for item in missing))
         self.assertTrue(near)
 
-    def test_unsupported_power_is_classified_as_reroll_required(self):
+    def test_unsupported_power_is_classified_as_non_target(self):
         bot = PowerCandidateBot([
             (
                 "tesseract-full-original-psm6",
@@ -322,10 +322,10 @@ class PowersFoundationTests(unittest.TestCase):
             )
         ])
         state, trait, summary, _text, missing, near = bot.check_roll()
-        self.assertEqual(state, "DISABLED")
+        self.assertEqual(state, "NON_TARGET")
         self.assertEqual(trait, "non_target_power")
-        self.assertIn("manual reroll required", summary.lower())
-        self.assertEqual(missing, ["Unsupported power"])
+        self.assertIn("filler power", summary.lower())
+        self.assertEqual(missing, ["Non-target power"])
         self.assertFalse(near)
 
     def test_specs_classification_still_works_unchanged(self):

@@ -2762,6 +2762,7 @@ class AelrithForgeBot:
                     context=context,
                 )
                 self._apply_recovery_outcome(outcome)
+                self.last_recovery_verify_details["samples_detail"] = list(samples[-3:])
                 self.log(
                     f"{context} early exit | reason={weak_exit_reason} | weak_samples={weak_samples}/{index + 1} | "
                     f"image_changed_samples={image_changed_samples} | max_change_score={max_change_score:.2f} | elapsed={elapsed_ms}ms"
@@ -2881,6 +2882,7 @@ class AelrithForgeBot:
                     context=context,
                 )
                 self._apply_recovery_outcome(outcome)
+                self.last_recovery_verify_details["samples_detail"] = list(samples[-3:])
                 self._write_ocr_debug_event(
                     "recovery_confirmation_fast_failed_unreadable",
                     {
@@ -4243,6 +4245,49 @@ class AelrithForgeBot:
             "passive_detected": bool(passive and passive.get("detected")),
         }
 
+    def _startup_power_bad_from_verify_samples(self, label, verify_details=None):
+        if self.roll_domain != "powers":
+            return "none"
+        details = dict(verify_details or self.last_recovery_verify_details or {})
+        samples = details.get("samples_detail") or []
+        if not samples:
+            return "none"
+        for sample in reversed(samples):
+            text = str(sample.get("cleaned") or sample.get("sample_text") or "").strip()
+            if not text:
+                continue
+            parsed = parse_power_roll_text(text)
+            if not parsed:
+                continue
+            power_key = parsed.get("power")
+            if power_key not in SUPPORTED_POWER_DEFINITIONS:
+                continue
+            state, trait, summary, ocr_text, missing, _near = self.evaluate_power_trait_with_values(
+                power_key,
+                parsed.get("values") or {},
+                text,
+                source_name=f"{label} verify sample",
+                passive=parsed.get("passive"),
+            )
+            if state != "BAD":
+                continue
+            self.log(
+                "Startup verification saw supported BAD Power; routing to manual reroll | "
+                f"trait={power_display_name(trait)} | missing={' ; '.join(missing or []) or 'target stats not met'} | "
+                f"sample={self._compact_debug_text(text)}"
+            )
+            if not self._confirm_power_bad_before_manual_reroll(
+                trait,
+                missing,
+                context=f"{label} sampled Power BAD manual reroll",
+            ):
+                self.log("Startup sampled Power BAD was not stable enough for manual reroll; continuing safe failure path")
+                return "deferred"
+            if self.manual_reroll_flow(f"{label.lower()} current bad {trait or 'unknown'}"):
+                return "rerolled"
+            return "failed"
+        return "none"
+
     def _power_required_target_values(self, power_key, values, passive=None):
         required = {}
         definition = SUPPORTED_POWER_DEFINITIONS.get(power_key)
@@ -4977,6 +5022,27 @@ class AelrithForgeBot:
                 popup_state=popup_after_auto,
                 popup_cleared=popup_cleared_during_startup,
             )
+            if self.roll_domain == "powers" and final_verify_state in ("not_rolling", "unreadable_static", "unreadable_but_changed"):
+                sampled_power_route = self._startup_power_bad_from_verify_samples(label, final_verify_details)
+                if sampled_power_route == "rerolled":
+                    self._record_startup_route(
+                        "manual_reroll",
+                        reason="startup_verify_sample_supported_bad_power",
+                        confidence="strong",
+                        supports=["verify_sample_bad_power"],
+                    )
+                    self._record_recovery_duration(label, started)
+                    return finish(True, STARTUP_CONFIRMED_ROLLING, rolling_confirmed=True)
+                if sampled_power_route == "failed":
+                    self._record_startup_route(
+                        "manual_reroll",
+                        reason="startup_verify_sample_bad_power_manual_reroll_failed",
+                        confidence="strong",
+                        supports=["verify_sample_bad_power"],
+                        failure_type="manual_reroll_failed",
+                    )
+                    self._record_recovery_duration(label, started, success=False)
+                    return finish(False, STARTUP_FAILED_NO_ROLL_DETECTED)
             support_signals = final_support.get("signals") or []
             startup_spec_class = startup_spec_class if startup_recovery else (getattr(self, "_startup_context", {}).get("current_spec_class", "unknown") if self._startup_context_active() else "unknown")
             safe_filler_state = (safe_filler_state if startup_recovery else startup_spec_class == "NON_TARGET filler") and not popup_after_auto
@@ -7505,27 +7571,6 @@ class AelrithForgeBot:
                 best_supported = candidate
         return best_supported, fallback_text
 
-    def _power_fallback_roll_evidence(self, text):
-        cleaned = normalize_text(text or "")
-        if not cleaned:
-            return False
-        numbers = extract_numbers(cleaned)
-        if not numbers:
-            return False
-        normalized_stats = normalize_stat_tokens(cleaned)
-        has_power_stat = any(
-            token in normalized_stats
-            for token in ("damage", "hp", "crit_rate", "crit_damage", "luck", "npc_damage")
-        )
-        if not has_power_stat:
-            return False
-        has_title_shape = bool(
-            re.search(r"\bcurrent\s+power\b", cleaned)
-            or re.search(r"\b[a-z][a-z0-9]{3,}\s*[>:-]", cleaned)
-            or re.search(r"^\s*[a-z][a-z0-9]{3,}\s+(?:hp|damage|crit|luck|npc)\b", cleaned)
-        )
-        return has_title_shape
-
     def _power_assigned_values(self, power_key, values, passive=None):
         assigned = {stat.label: values.get(stat.key) for stat in SUPPORTED_POWER_DEFINITIONS[power_key].stats}
         if passive and passive.get("detected"):
@@ -7662,34 +7707,16 @@ class AelrithForgeBot:
         parsed, fallback_text = self._parse_power_candidates(candidates)
         if not parsed:
             if fallback_text:
-                if self._power_fallback_roll_evidence(fallback_text):
-                    self.log("CURRENT POWER gate | unsupported/non-target Power detected; manual reroll required")
-                    self.record_decision_chain(
-                        subsystem="Classification",
-                        classification="DISABLED",
-                        classification_reason="unsupported or non-target power outside enabled target set requires manual reroll",
-                        current_trait="Non-target Power",
-                        parsed_values={},
-                        summary="Unsupported or non-target Power observed; manual reroll required",
-                        power_candidate_source="fallback_power_text",
-                    )
-                    return (
-                        "DISABLED",
-                        "non_target_power",
-                        "Unsupported or non-target Power observed; manual reroll required",
-                        fallback_text,
-                        ["Unsupported power"],
-                        False,
-                    )
-                self.log("CURRENT POWER gate | supported mythical not detected; treating unreadable power text as rolling")
+                self.log("CURRENT POWER gate | supported mythical not detected; treating current power as non-target filler")
                 self.record_decision_chain(
                     subsystem="Classification",
-                    classification="ROLLING",
-                    classification_reason="supported power not detected from weak fallback OCR",
-                    current_trait="none",
+                    classification="NON_TARGET",
+                    classification_reason="unsupported or filler power outside supported mythical foundation set",
+                    current_trait="Non-target Power",
                     parsed_values={},
+                    summary="Unsupported or filler power observed; letting Auto continue",
                 )
-                return "ROLLING", None, "", fallback_text, [], False
+                return "NON_TARGET", "non_target_power", "Unsupported or filler power observed; letting Auto continue", fallback_text, ["Non-target power"], False
             self.record_decision_chain(
                 subsystem="Classification",
                 classification="ROLLING",
