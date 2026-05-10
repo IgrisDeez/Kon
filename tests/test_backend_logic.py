@@ -2192,7 +2192,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertLess(summary_idx, passive_force_idx)
         self.assertLess(summary_idx, power_force_idx)
 
-    def test_unsupported_power_non_target_does_not_enter_manual_reroll(self):
+    def test_unsupported_power_routes_to_manual_reroll_required(self):
         bot = StubBot(
             [
                 (
@@ -2203,17 +2203,40 @@ class BackendLogicTests(unittest.TestCase):
             ]
         )
         bot.set_roll_domain("powers")
-        bot.manual_reroll_flow = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("unsupported/filler powers should not enter manual reroll")
-        )
 
         state, trait, summary, _text, missing, near = bot.check_roll()
 
-        self.assertEqual(state, "NON_TARGET")
+        self.assertEqual(state, "DISABLED")
         self.assertEqual(trait, "non_target_power")
-        self.assertIn("Unsupported or filler power observed", summary)
-        self.assertEqual(missing, ["Non-target power"])
+        self.assertIn("manual reroll required", summary)
+        self.assertEqual(missing, ["Unsupported power"])
         self.assertFalse(near)
+
+    def test_powers_startup_unsupported_current_power_manual_rerolls(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_roll_domain("powers")
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.check_roll = lambda *args, **kwargs: (
+            "DISABLED",
+            "non_target_power",
+            "Unsupported or non-target Power observed; manual reroll required",
+            "Battleborn HP 7.1 Damage 5.7",
+            ["Unsupported power"],
+            False,
+        )
+        manual_calls = []
+
+        def manual_reroll(reason=""):
+            manual_calls.append(reason)
+            bot.last_manual_reroll_confirmed_at = time.perf_counter()
+            return True
+
+        bot.manual_reroll_flow = manual_reroll
+
+        self.assertEqual(bot.startup_check_current_roll(), "rerolled")
+        self.assertEqual(manual_calls, ["startup current disabled non_target_power"])
+        self.assertTrue(any("manual rerolling immediately" in message for message in messages))
 
     def test_startup_high_value_current_spec_stops_as_before(self):
         messages = []

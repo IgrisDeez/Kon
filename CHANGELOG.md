@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.100.10
+
+- Routed clear unsupported or non-target Powers such as Battleborn/Berserker into manual reroll instead of treating them as Auto-roll filler.
+- Kept weak unreadable Power fallback OCR in rolling/uncertain state so noisy text alone still does not trigger confirmation clicks.
+- Added regressions for unsupported Power classification and startup manual reroll routing.
+
 ## v1.100.9
 
 - Confirmed manual reroll resume after a cleared popup when Auto resume produces image change plus readable roll-like OCR, without accepting stale text alone.

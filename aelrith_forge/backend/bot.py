@@ -7505,6 +7505,27 @@ class AelrithForgeBot:
                 best_supported = candidate
         return best_supported, fallback_text
 
+    def _power_fallback_roll_evidence(self, text):
+        cleaned = normalize_text(text or "")
+        if not cleaned:
+            return False
+        numbers = extract_numbers(cleaned)
+        if not numbers:
+            return False
+        normalized_stats = normalize_stat_tokens(cleaned)
+        has_power_stat = any(
+            token in normalized_stats
+            for token in ("damage", "hp", "crit_rate", "crit_damage", "luck", "npc_damage")
+        )
+        if not has_power_stat:
+            return False
+        has_title_shape = bool(
+            re.search(r"\bcurrent\s+power\b", cleaned)
+            or re.search(r"\b[a-z][a-z0-9]{3,}\s*[>:-]", cleaned)
+            or re.search(r"^\s*[a-z][a-z0-9]{3,}\s+(?:hp|damage|crit|luck|npc)\b", cleaned)
+        )
+        return has_title_shape
+
     def _power_assigned_values(self, power_key, values, passive=None):
         assigned = {stat.label: values.get(stat.key) for stat in SUPPORTED_POWER_DEFINITIONS[power_key].stats}
         if passive and passive.get("detected"):
@@ -7641,16 +7662,34 @@ class AelrithForgeBot:
         parsed, fallback_text = self._parse_power_candidates(candidates)
         if not parsed:
             if fallback_text:
-                self.log("CURRENT POWER gate | supported mythical not detected; treating current power as non-target filler")
+                if self._power_fallback_roll_evidence(fallback_text):
+                    self.log("CURRENT POWER gate | unsupported/non-target Power detected; manual reroll required")
+                    self.record_decision_chain(
+                        subsystem="Classification",
+                        classification="DISABLED",
+                        classification_reason="unsupported or non-target power outside enabled target set requires manual reroll",
+                        current_trait="Non-target Power",
+                        parsed_values={},
+                        summary="Unsupported or non-target Power observed; manual reroll required",
+                        power_candidate_source="fallback_power_text",
+                    )
+                    return (
+                        "DISABLED",
+                        "non_target_power",
+                        "Unsupported or non-target Power observed; manual reroll required",
+                        fallback_text,
+                        ["Unsupported power"],
+                        False,
+                    )
+                self.log("CURRENT POWER gate | supported mythical not detected; treating unreadable power text as rolling")
                 self.record_decision_chain(
                     subsystem="Classification",
-                    classification="NON_TARGET",
-                    classification_reason="unsupported or filler power outside supported mythical foundation set",
-                    current_trait="Non-target Power",
+                    classification="ROLLING",
+                    classification_reason="supported power not detected from weak fallback OCR",
+                    current_trait="none",
                     parsed_values={},
-                    summary="Unsupported or filler power observed; letting Auto continue",
                 )
-                return "NON_TARGET", "non_target_power", "Unsupported or filler power observed; letting Auto continue", fallback_text, ["Non-target power"], False
+                return "ROLLING", None, "", fallback_text, [], False
             self.record_decision_chain(
                 subsystem="Classification",
                 classification="ROLLING",
