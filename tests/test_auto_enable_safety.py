@@ -519,11 +519,11 @@ class AutoEnableSafetyTests(unittest.TestCase):
             banner_known_clear=True,
         )
 
-        self.assertEqual(result, "recovered")
+        self.assertEqual(result, "skipped")
         self.assertEqual(calls["reads"], 2)
-        self.assertEqual(len(clicks), 1)
+        self.assertEqual(clicks, [])
         self.assertTrue(any("ambiguous checkbox confirm" in context for context in contexts))
-        self.assertTrue(any("reason=weak_enabled_compact_verify_failed" in message for message in messages))
+        self.assertTrue(any("suppressed ambiguous checkbox click" in message for message in messages))
 
     def test_watchdog_off_panel_ambiguous_state_skips_recovery_click(self):
         messages = []
@@ -570,11 +570,11 @@ class AutoEnableSafetyTests(unittest.TestCase):
             banner_known_clear=True,
         )
 
-        self.assertEqual(result, "off_panel")
+        self.assertEqual(result, "skipped")
         self.assertEqual(clicks, [])
         self.assertEqual(contexts, ["Unexpected No-Roll Watchdog ambiguous checkbox confirm"])
-        self.assertEqual(bot.last_recovery_route_snapshot["route_reason"], "roll_panel_not_visible_or_unreadable")
-        self.assertTrue(any("recovery skipped because reroll panel is not visible or OCR regions are off target" in message for message in messages))
+        self.assertEqual(bot.last_recovery_route_snapshot["route_reason"], "ambiguous_checkbox_no_activity")
+        self.assertTrue(any("suppressed ambiguous checkbox click" in message for message in messages))
 
     def test_watchdog_weak_enabled_compact_verify_can_restore_without_click(self):
         messages = []
@@ -628,7 +628,7 @@ class AutoEnableSafetyTests(unittest.TestCase):
         self.assertEqual(clicks, [])
         self.assertTrue(any("weak-enabled compact verify confirmed rolling activity" in message for message in messages))
 
-    def test_watchdog_rejects_weak_trait_change_and_clicks_once(self):
+    def test_watchdog_rejects_weak_trait_change_without_blind_click(self):
         messages = []
         bot = self.make_bot(messages)
         states = iter(["unknown", "unknown"])
@@ -649,15 +649,6 @@ class AutoEnableSafetyTests(unittest.TestCase):
                 }
                 bot.last_recovery_reason = "multi_source_trait_changed:rampage"
                 return True, "current spec rampage combo ramp 20 damage 20"
-            if "Watchdog verify" in context:
-                bot.last_recovery_verify_details = {
-                    "reason": "popup_confirmed_mid_polling",
-                    "signal_sources": ["ocr", "popup", "banner", "image_change"],
-                    "image_changed_samples": 0,
-                    "max_change_score": 0.0,
-                }
-                bot.last_recovery_reason = "popup_confirmed_mid_polling"
-                return True, "current spec rampage combo ramp 20 damage 20"
             raise AssertionError(f"unexpected stats_changed context: {context}")
 
         bot.stats_changed = fake_stats_changed
@@ -673,10 +664,10 @@ class AutoEnableSafetyTests(unittest.TestCase):
             allow_early=True,
         )
 
-        self.assertEqual(result, "recovered")
-        self.assertEqual(len(clicks), 1)
+        self.assertEqual(result, "skipped")
+        self.assertEqual(clicks, [])
         self.assertTrue(any("weak rolling evidence rejected for ambiguous checkbox guard" in message for message in messages))
-        self.assertTrue(any("auto re-enable attempt sent" in message for message in messages))
+        self.assertTrue(any("suppressed ambiguous checkbox click" in message for message in messages))
 
     def test_watchdog_skips_click_when_guard_has_real_activity_support(self):
         messages = []

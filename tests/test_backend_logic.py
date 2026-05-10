@@ -304,7 +304,8 @@ class BackendLogicTests(unittest.TestCase):
         changed, sample = bot.stats_changed("DamageI>Damage6.7%", context="unit activity")
         self.assertFalse(changed)
         self.assertEqual(sample, "DamageI>Damage6.7%")
-        self.assertTrue(any("unreliable_stats_samples=2/2" in message for message in bot.messages))
+        self.assertEqual(bot.last_recovery_verify_details.get("rejection_reason"), "no_material_change")
+        self.assertTrue(any("unreliable_stats_samples=0/2" in message for message in bot.messages))
 
     def test_recovery_rejects_same_trait_seen_without_material_change(self):
         bot = ActivityStubBot(
@@ -849,19 +850,20 @@ class BackendLogicTests(unittest.TestCase):
 
                 result = bot.unexpected_not_rolling_watchdog("same current text", "ROLLING", "rampage", 2.0)
 
-                self.assertEqual(result, "recovered")
-                self.assertEqual(len(clicks), 1)
-                self.assertEqual(clicks[0][0][1], "Unexpected No-Roll Watchdog Auto Re-enable")
                 if checkbox_state == "disabled":
+                    self.assertEqual(result, "recovered")
+                    self.assertEqual(len(clicks), 1)
+                    self.assertEqual(clicks[0][0][1], "Unexpected No-Roll Watchdog Auto Re-enable")
                     self.assertEqual(len(calls), 1)
                     self.assertEqual(calls[0][1], "Unexpected No-Roll Watchdog verify")
                     self.assertEqual(calls[0][2], ("watchdog_auto_reenable",))
+                    self.assertTrue(any("Unexpected No-Roll Watchdog | verified rolling resumed" in message for message in messages))
                 else:
-                    self.assertEqual(len(calls), 2)
+                    self.assertEqual(result, "skipped")
+                    self.assertEqual(clicks, [])
+                    self.assertEqual(len(calls), 1)
                     self.assertEqual(calls[0][1], "Unexpected No-Roll Watchdog ambiguous checkbox confirm")
-                    self.assertEqual(calls[1][1], "Unexpected No-Roll Watchdog verify")
-                    self.assertEqual(calls[1][2], ("watchdog_auto_reenable",))
-                self.assertTrue(any("Unexpected No-Roll Watchdog | verified rolling resumed" in message for message in messages))
+                    self.assertTrue(any("suppressed ambiguous checkbox click" in message for message in messages))
 
     def test_unexpected_no_roll_watchdog_success_clears_stale_signature(self):
         messages = []
@@ -873,7 +875,7 @@ class BackendLogicTests(unittest.TestCase):
         bot._interruptible_sleep = lambda *_args, **_kwargs: True
         bot.popup_active = lambda *_args, **_kwargs: False
         bot.banner_active = lambda: False
-        bot.auto_checkbox_state = lambda: "unknown"
+        bot.auto_checkbox_state = lambda: "disabled"
         bot.stats_changed = lambda *_args, **_kwargs: (True, "current spec rampage combo ramp 23 damage 24")
         bot.click = lambda *_args, **_kwargs: None
         bot.last_watchdog_attempt_at = time.time()
@@ -977,7 +979,7 @@ class BackendLogicTests(unittest.TestCase):
         bot._interruptible_sleep = lambda *_args, **_kwargs: True
         bot.popup_active = lambda *_args, **_kwargs: False
         bot.banner_active = lambda: False
-        bot.auto_checkbox_state = lambda: "unknown"
+        bot.auto_checkbox_state = lambda: "disabled"
         bot.stats_changed = lambda *_args, **_kwargs: (False, "same current text")
         clicks = []
         bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
@@ -1080,6 +1082,8 @@ class BackendLogicTests(unittest.TestCase):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
         bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.popup_active = lambda *_args, **_kwargs: False
+        bot.banner_active = lambda: False
         bot.check_roll = lambda *args, **kwargs: (
             "NON_TARGET",
             "vigor",
@@ -1630,7 +1634,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(clicks[0][0][1], "Initial Auto Start Guarded Startup Enable")
         self.assertTrue(any("double_check_skipped=True | reason=guarded_recovery_decisive_nonconfirming" in message for message in messages))
 
-    def test_specs_safe_filler_unknown_auto_with_weak_refresh_continues_without_click_or_manual_reroll(self):
+    def test_specs_safe_filler_unknown_auto_with_weak_refresh_fails_without_fake_confirm(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
         bot.set_roll_domain("specs")
@@ -1675,12 +1679,13 @@ class BackendLogicTests(unittest.TestCase):
 
         bot.stats_changed = fake_stats_changed
 
-        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
+        self.assertFalse(bot.start_or_recover("Initial Auto Start"))
         self.assertEqual(stats_calls, ["Initial Auto Start preflight rolling check", "Initial Auto Start auto verify"])
         self.assertEqual(clicks, [])
         self.assertEqual(manual_calls, [])
-        self.assertTrue(any("spec_safe_filler_weak_rolling_signal_no_blind_click" in message for message in messages))
+        self.assertTrue(any("spec_safe_filler_weak_stale_evidence_rejected" in message for message in messages))
         self.assertTrue(any("spec safe filler startup avoided blind Auto click" in message for message in messages))
+        self.assertTrue(any("decision=fail_safe_without_fake_confirm" in message for message in messages))
         self.assertFalse(any("Manual reroll flow" in message for message in messages))
 
     def test_specs_safe_filler_unknown_auto_without_useful_evidence_fails_without_click_or_manual_reroll(self):

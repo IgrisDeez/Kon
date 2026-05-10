@@ -431,6 +431,31 @@ def parse_match_number(text: str, match, group=1):
         return None
 
 
+def _ocr_word_is_stat_fragment(word: str) -> bool:
+    compact = re.sub(r"[^a-z0-9]+", "", str(word or "").lower())
+    compact = re.sub(r"(?:viii|vii|vi|iv|ix|iii|ii|i|v|x)$", "", compact)
+    if compact in {
+        "damage",
+        "dmg",
+        "crit",
+        "critrate",
+        "critchance",
+        "critdamage",
+        "critdmg",
+        "hp",
+        "luck",
+        "drop",
+        "npcdmg",
+        "npcdamage",
+        "comboramp",
+        "combo",
+    }:
+        return True
+    normalized = normalize_stat_tokens(compact)
+    stat_keys = {"combo_ramp", "damage", "crit_rate", "crit_damage", "drop", "luck", "npc_damage"}
+    return bool(normalized in stat_keys or any(token in stat_keys for token in normalized.split()))
+
+
 def detect_trait(text: str):
     normalized = normalize_text(text)
     for trait, aliases in TRAIT_ALIASES.items():
@@ -444,6 +469,8 @@ def detect_trait(text: str):
         if len(alias) >= 4 and " " not in alias
     }
     for word in words:
+        if _ocr_word_is_stat_fragment(word):
+            continue
         match = difflib.get_close_matches(word, aliases.keys(), n=1, cutoff=0.72)
         if match:
             return aliases[match[0]]
@@ -2027,6 +2054,9 @@ class AelrithForgeBot:
     def detect_rollable_trait(self, text):
         return detect_rollable_trait(text)
 
+    def _generic_trait_word_is_stat_fragment(self, word):
+        return _ocr_word_is_stat_fragment(word)
+
     def _generic_rollable_non_target_from_text(self, text):
         cleaned = normalize_text(text)
         if not self.has_current_spec_marker(cleaned):
@@ -2042,7 +2072,14 @@ class AelrithForgeBot:
             compact,
         )
         compact = re.sub(r"\b(?:damage|dmg|crit|chance|rate|range|speed|cooldown|drop|luck|npc|cap)\b", " ", compact)
-        words = [word for word in re.findall(r"[a-z]{4,}", compact) if word not in {"current", "spec"}]
+        raw_words = [word for word in re.findall(r"[a-z]{4,}", compact) if word not in {"current", "spec"}]
+        words = [
+            word
+            for word in raw_words
+            if not self._generic_trait_word_is_stat_fragment(word)
+        ]
+        if raw_words and not words:
+            return None
         return words[0] if words else "non_target"
 
     def _reroll_popup_signal(self, text):
@@ -2182,18 +2219,21 @@ class AelrithForgeBot:
             baseline_numbers,
             numbers,
         )
+        baseline_marker = self.has_current_spec_marker(baseline_clean)
+        structured_without_marker = bool(trait and stat_signal and len(numbers) >= 3)
+        strong_structure = bool(marker or baseline_marker or structured_without_marker)
 
         if marker and (trait or stat_signal) and materially_different:
             return cleaned, "current_spec_marker_changed"
         if trait:
             baseline_trait = self.detect_rollable_trait(baseline_clean) or self._generic_rollable_non_target_from_text(baseline_clean)
-            if trait != baseline_trait and materially_different and (stat_signal or numbers):
+            if strong_structure and trait != baseline_trait and materially_different and (stat_signal or numbers):
                 return cleaned, f"trait_changed:{trait}"
-        if stat_signal and numbers and self._recovery_numbers_changed(baseline_numbers, numbers):
+        if strong_structure and stat_signal and numbers and self._recovery_numbers_changed(baseline_numbers, numbers):
             return cleaned, "stat_numbers_changed"
-        if trait and numbers and self._recovery_numbers_changed(baseline_numbers, numbers):
+        if strong_structure and trait and numbers and self._recovery_numbers_changed(baseline_numbers, numbers):
             return cleaned, "trait_values_changed"
-        if materially_different and (trait or stat_signal) and numbers:
+        if strong_structure and materially_different and (trait or stat_signal) and numbers:
             return cleaned, "structured_ocr_text_changed"
 
         return cleaned, None
@@ -2252,14 +2292,17 @@ class AelrithForgeBot:
                 baseline_numbers,
                 numbers,
             )
+            baseline_marker = self.has_current_spec_marker(baseline_clean)
+            structured_without_marker = bool(trait and stat_signal and len(numbers) >= 3)
+            strong_structure = bool(marker or baseline_marker or structured_without_marker)
             if marker and (trait or stat_signal) and materially_different:
                 return text, "multi_source_current_spec_marker_changed", None
             baseline_trait = self.detect_rollable_trait(baseline_clean) or self._generic_rollable_non_target_from_text(baseline_clean)
-            if trait and trait != baseline_trait and materially_different and (stat_signal or numbers):
+            if strong_structure and trait and trait != baseline_trait and materially_different and (stat_signal or numbers):
                 return text, f"multi_source_trait_changed:{trait}", None
-            if stat_signal and numbers and self._recovery_numbers_changed(baseline_numbers, numbers):
+            if strong_structure and stat_signal and numbers and self._recovery_numbers_changed(baseline_numbers, numbers):
                 return text, "multi_source_stat_numbers_changed", None
-            if trait and numbers and self._recovery_numbers_changed(baseline_numbers, numbers):
+            if strong_structure and trait and numbers and self._recovery_numbers_changed(baseline_numbers, numbers):
                 return text, "multi_source_trait_values_changed", None
 
         return useful[0][1], None, f"multi_source_useful={len(useful)}_but_no_activity_change"
@@ -3304,8 +3347,59 @@ class AelrithForgeBot:
                 effective_checkbox_state = self._effective_auto_checkbox_state(checkbox_state, checkbox_confidence)
                 if effective_checkbox_state == "strong_enabled":
                     self.log(
-                        "Unexpected No-Roll Watchdog | Auto appears enabled after ambiguous recheck; verifying without forced click"
+                        "Unexpected No-Roll Watchdog | suppressed ambiguous checkbox click because Auto appears enabled "
+                        "after recheck and guard verification did not show strong rolling evidence"
                     )
+                    self._set_recovery_route_snapshot(
+                        result="skipped",
+                        route_reason="ambiguous_checkbox_enabled_without_activity",
+                        auto_state=str(effective_checkbox_state),
+                        rolling_confirmed=False,
+                        failure_type="ambiguous_checkbox_enabled_without_activity",
+                        support_signals=["ambiguous_checkbox_guard"],
+                        context="watchdog",
+                    )
+                    self._write_ocr_debug_event(
+                        "unexpected_no_roll_watchdog",
+                        {
+                            "phase": "skipped",
+                            "reason": "ambiguous_checkbox_enabled_without_activity",
+                            "checkbox_state": checkbox_state,
+                            "effective_checkbox_state": effective_checkbox_state,
+                            "state": state,
+                            "trait": trait,
+                            "signature": signature,
+                        },
+                    )
+                    return "skipped"
+                elif effective_checkbox_state in ("ambiguous", "weak_enabled"):
+                    self.log(
+                        "Unexpected No-Roll Watchdog | suppressed ambiguous checkbox click because guard verification "
+                        "showed no strong rolling evidence and final checkbox recheck stayed unclear | "
+                        f"checkbox_state={checkbox_state} effective_state={effective_checkbox_state}"
+                    )
+                    self._set_recovery_route_snapshot(
+                        result="skipped",
+                        route_reason="ambiguous_checkbox_no_activity",
+                        auto_state=str(effective_checkbox_state),
+                        rolling_confirmed=False,
+                        failure_type="ambiguous_checkbox_no_activity",
+                        support_signals=["ambiguous_checkbox_guard"],
+                        context="watchdog",
+                    )
+                    self._write_ocr_debug_event(
+                        "unexpected_no_roll_watchdog",
+                        {
+                            "phase": "skipped",
+                            "reason": "ambiguous_checkbox_no_activity",
+                            "checkbox_state": checkbox_state,
+                            "effective_checkbox_state": effective_checkbox_state,
+                            "state": state,
+                            "trait": trait,
+                            "signature": signature,
+                        },
+                    )
+                    return "skipped"
                 elif effective_checkbox_state not in ("disabled", "ambiguous", "weak_enabled"):
                     self.log(
                         "Unexpected No-Roll Watchdog | skipped unsupported checkbox state after ambiguous recheck="
@@ -4531,20 +4625,21 @@ class AelrithForgeBot:
                 weak_support = list(startup_primary_support.get("signals") or [])
                 if weak_support:
                     self._record_startup_route(
-                        "continue",
-                        reason="spec_safe_filler_weak_rolling_signal_no_blind_click",
-                        confidence="marginal",
+                        "fail_safe",
+                        reason="spec_safe_filler_weak_stale_evidence_rejected",
+                        confidence="weak",
                         supports=weak_support,
+                        failure_type="weak_stale_evidence_not_proving_rolling",
                     )
                     self.log(
                         "spec safe filler startup avoided blind Auto click | "
-                        "route_reason=spec_safe_filler_weak_rolling_signal_no_blind_click | "
-                        f"reason=weak_rolling_signal | support={'+'.join(weak_support)} | {label}"
+                        "route_reason=spec_safe_filler_weak_stale_evidence_rejected | "
+                        f"reason=weak_or_stale_rolling_signal | support={'+'.join(weak_support)} | "
+                        "decision=fail_safe_without_fake_confirm | "
+                        f"{label}"
                     )
-                    self.last_change = time.time()
-                    self.clear_recovery_failures(f"{label} safe filler weak rolling signal accepted without click")
-                    self._record_recovery_duration(label, started)
-                    return finish(True, STARTUP_CONFIRMED_ROLLING, rolling_confirmed=True)
+                    self._record_recovery_duration(label, started, success=False)
+                    return finish(False, failed_result("uncertain_existing_state"))
                 self._record_startup_route(
                     "fail_safe",
                     reason="spec_safe_filler_unproven_auto_state_fail_safe",
@@ -4807,20 +4902,21 @@ class AelrithForgeBot:
             if self.roll_domain == "specs" and safe_filler_state and followup_state != "disabled":
                 if support_signals:
                     self._record_startup_route(
-                        "continue",
-                        reason="spec_safe_filler_weak_rolling_signal_no_blind_click",
-                        confidence="marginal",
+                        "fail_safe",
+                        reason="spec_safe_filler_weak_stale_evidence_rejected",
+                        confidence="weak",
                         supports=support_signals,
+                        failure_type="weak_stale_evidence_not_proving_rolling",
                     )
                     self.log(
                         "spec safe filler startup avoided blind Auto click | "
-                        "route_reason=spec_safe_filler_weak_rolling_signal_no_blind_click | "
-                        f"reason=weak_rolling_signal | support={'+'.join(support_signals)} | {label}"
+                        "route_reason=spec_safe_filler_weak_stale_evidence_rejected | "
+                        f"reason=weak_or_stale_rolling_signal | support={'+'.join(support_signals)} | "
+                        "decision=fail_safe_without_fake_confirm | "
+                        f"{label}"
                     )
-                    self.last_change = time.time()
-                    self.clear_recovery_failures(f"{label} safe filler weak rolling signal accepted without manual reroll")
-                    self._record_recovery_duration(label, started)
-                    return finish(True, STARTUP_CONFIRMED_ROLLING, rolling_confirmed=True)
+                    self._record_recovery_duration(label, started, success=False)
+                    return finish(False, failed_result(auto_enable_result))
                 self._record_startup_route(
                     "fail_safe",
                     reason="spec_safe_filler_unproven_auto_state_fail_safe",

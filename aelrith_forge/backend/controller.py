@@ -8,7 +8,35 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal
+try:
+    from PySide6.QtCore import QObject, Signal
+except ModuleNotFoundError:
+    class QObject:
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class _BoundSignal:
+        def __init__(self, slots):
+            self._slots = slots
+
+        def connect(self, slot):
+            self._slots.append(slot)
+
+        def emit(self, *args):
+            for slot in list(self._slots):
+                slot(*args)
+
+    class Signal:
+        def __init__(self, *types):
+            self._name = ""
+
+        def __set_name__(self, owner, name):
+            self._name = f"__signal_{name}"
+
+        def __get__(self, instance, owner):
+            if instance is None:
+                return self
+            return _BoundSignal(instance.__dict__.setdefault(self._name, []))
 
 from .. import APP_DISPLAY_NAME, APP_VERSION, SETTINGS_SCHEMA_VERSION
 from . import bot as bot_module

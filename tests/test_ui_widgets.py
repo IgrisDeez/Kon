@@ -5,7 +5,10 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton, QScrollArea
+try:
+    from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton, QScrollArea
+except ModuleNotFoundError:
+    raise unittest.SkipTest("PySide6 is not installed")
 
 from aelrith_forge import APP_DISPLAY_NAME, APP_VERSION
 from aelrith_forge.backend.controller import BotController

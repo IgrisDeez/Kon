@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.100.7
+
+- Hardened startup and watchdog recovery so weak stale OCR and ambiguous Auto checkbox reads no longer fake-confirm rolling or trigger blind clicks.
+- Rejected glued stat fragments such as `CritDamageI` and `CritChanceII` as generic non-target traits while preserving real filler traits.
+- Added parser/watchdog regressions plus a headless pytest fallback for backend-only controller imports.
+
 ## v1.100.6
 
 - Fixed a watchdog crash when an ambiguous Auto checkbox recheck became weak-enabled before the recovery click.
