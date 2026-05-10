@@ -3007,6 +3007,7 @@ class AelrithForgeBot:
         )
         self._apply_recovery_outcome(outcome)
         self.last_recovery_verify_details["unreliable_samples"] = unreliable_samples
+        self.last_recovery_verify_details["samples_detail"] = list(samples[-3:])
         self._write_ocr_debug_event(
             "recovery_confirmation_failed",
             {
@@ -3815,6 +3816,7 @@ class AelrithForgeBot:
                 "polls_override": transition_profile.get("compact_verify_polls", 2),
                 "poll_delay_override": transition_profile.get("compact_verify_poll_delay", 0.03),
                 "unreadable_fast_fail_polls": 2,
+                "candidate_signal_enabled": False,
                 "abandon_on_weak_samples": transition_profile.get("compact_verify_abandon_on_weak_samples", 1),
                 "initial_popup_known_false": popup_known_false,
                 "post_popup_check_enabled": not popup_known_false,
@@ -3830,6 +3832,7 @@ class AelrithForgeBot:
                 "polls_override": 2,
                 "poll_delay_override": transition_profile["resume_verify_poll_delay"],
                 "unreadable_fast_fail_polls": 2,
+                "candidate_signal_enabled": False,
                 "initial_popup_known_false": popup_known_false,
                 "post_popup_check_enabled": not popup_known_false,
                 "fast_popup_checks": True,
@@ -3912,9 +3915,67 @@ class AelrithForgeBot:
             "max_change_score": round(max_change_score, 2),
         }
 
+    def _manual_reroll_roll_like_refresh_sample(self, samples):
+        for sample in samples or []:
+            cleaned = str(sample.get("cleaned") or "").strip()
+            if not cleaned or sample.get("unreliable") or sample.get("trait_only"):
+                continue
+            if not sample.get("image_changed"):
+                continue
+            if not sample.get("materially_different") and not sample.get("reason"):
+                continue
+            numbers = extract_numbers(cleaned)
+            stat_signal = self._has_activity_stat_signal(cleaned)
+            trait = self.detect_rollable_trait(cleaned) or self._generic_rollable_non_target_from_text(cleaned)
+            if numbers and (stat_signal or trait):
+                return cleaned
+        return ""
+
     def _manual_reroll_resume_support(self, verify_details=None, verify_reason=None, popup_recently_cleared=False):
-        support = self._auto_reenable_guard_support(verify_details, verify_reason)
-        if support.get("strong"):
+        outcome = self._recovery_outcome_from_inputs(None, verify_details, verify_reason)
+        resolved_reason = self._recovery_outcome_reason(outcome)
+        confirmed_like = bool(
+            outcome.confirmed
+            or (
+                resolved_reason
+                and not outcome.rejection_reason
+                and outcome.classification not in {
+                    "session_blocked",
+                    "unreadable_static",
+                    "unreadable_but_changed",
+                }
+            )
+        )
+        if confirmed_like:
+            support = self._auto_reenable_guard_support(verify_details, verify_reason)
+            if support.get("strong"):
+                return support
+        else:
+            support = {
+                "strong": False,
+                "reason": resolved_reason or "none",
+                "signals": [],
+                "image_changed_samples": int(outcome.image_changed_samples or 0),
+                "max_change_score": round(float(outcome.max_change_score or 0.0), 2),
+            }
+            if (
+                popup_recently_cleared
+                and not outcome.unreadable
+                and outcome.classification == "not_rolling"
+                and resolved_reason == "readable_insufficient_change"
+                and int(outcome.image_changed_samples or 0) > 0
+            ):
+                sample_text = self._manual_reroll_roll_like_refresh_sample(
+                    (verify_details or {}).get("samples_detail") or []
+                )
+                if sample_text:
+                    return {
+                        **support,
+                        "strong": True,
+                        "reason": "recent_popup_clear_roll_like_ocr_after_image_change",
+                        "signals": ["recent_popup_clear", "image_change", "roll_like_ocr"],
+                        "sample_text": sample_text,
+                    }
             return support
         verify_reason = str(verify_reason or support.get("reason") or "").strip()
         refresh_reason = any(
@@ -4181,6 +4242,84 @@ class AelrithForgeBot:
             "parsed_values": parsed_values,
             "passive_detected": bool(passive and passive.get("detected")),
         }
+
+    def _power_required_target_values(self, power_key, values, passive=None):
+        required = {}
+        definition = SUPPORTED_POWER_DEFINITIONS.get(power_key)
+        if not definition:
+            return required
+        for target in definition.rule_targets:
+            if not target.required:
+                continue
+            if target.source == "passive":
+                value = None
+                if passive and passive.get("detected"):
+                    value = passive.get("value")
+            else:
+                value = (values or {}).get(target.key)
+            try:
+                required[target.label] = round(float(value), 4) if value is not None else None
+            except Exception:
+                required[target.label] = None
+        return required
+
+    def _power_parse_completeness(self, power_key, values, passive=None):
+        required = self._power_required_target_values(power_key, values, passive)
+        missing = [label for label, value in required.items() if value is None]
+        return {
+            "coherent": bool(required) and not missing,
+            "required_values": required,
+            "required_present": len(required) - len(missing),
+            "required_total": len(required),
+            "missing_required": missing,
+            "passive_detected": bool(passive and passive.get("detected")),
+        }
+
+    def _power_required_values_match(self, first, second):
+        return dict(first or {}) == dict(second or {})
+
+    def _confirm_power_bad_before_manual_reroll(self, trait, missing, context="Power BAD manual reroll"):
+        if self.roll_domain != "powers":
+            return True
+        initial_chain = dict(self.last_decision_chain or {})
+        initial_required = initial_chain.get("power_required_values") or {}
+        if not trait or not initial_chain.get("power_parse_coherent"):
+            self.log(
+                f"{context} deferred | reason=incomplete_initial_power_parse | "
+                f"trait={power_display_name(trait) if trait else 'unknown'}"
+            )
+            return False
+        if self._stop_requested("power BAD confirmation"):
+            return False
+        delay = min(0.08, max(0.0, float(self.cfg.get("PARTIAL_TARGET_CONFIRM_DELAY", 0.08))))
+        if delay and not self._interruptible_sleep(delay, "power BAD confirmation delay"):
+            return False
+        confirm_state, confirm_trait, _summary, _ocr_text, confirm_missing, _near = self.check_roll(allow_fallback=True)
+        confirm_chain = dict(self.last_decision_chain or {})
+        confirm_required = confirm_chain.get("power_required_values") or {}
+        stable = (
+            confirm_state == "BAD"
+            and confirm_trait == trait
+            and bool(confirm_chain.get("power_parse_coherent"))
+            and self._power_required_values_match(initial_required, confirm_required)
+            and list(confirm_missing or []) == list(missing or [])
+        )
+        if stable:
+            self.log(
+                f"{context} confirmed | trait={power_display_name(trait)} | "
+                f"missing={' ; '.join(missing or []) or 'none'} | "
+                f"quality={confirm_chain.get('power_candidate_quality', 'unknown')} | "
+                f"required={confirm_required}"
+            )
+            return True
+        self.log(
+            f"{context} rejected | initial_trait={power_display_name(trait)} | "
+            f"confirm_state={confirm_state} confirm_trait={power_display_name(confirm_trait) if confirm_trait else 'unknown'} | "
+            f"initial_required={initial_required} confirm_required={confirm_required} | "
+            f"initial_missing={' ; '.join(missing or []) or 'none'} | "
+            f"confirm_missing={' ; '.join(confirm_missing or []) or 'none'}"
+        )
+        return False
 
     def clear_reroll_popup(self, reason="popup", attempts=3, already_detected=False):
         started = time.perf_counter()
@@ -5174,6 +5313,22 @@ class AelrithForgeBot:
     def _manual_reroll_failure_reason(self) -> str:
         return f"bad {self._manual_reroll_target_kind()} manual reroll could not resume Auto safely"
 
+    def _manual_reroll_power_decision_context(self):
+        if self.roll_domain != "powers":
+            return ""
+        chain = dict(self.last_decision_chain or {})
+        if chain.get("classification") != "BAD":
+            return ""
+        trait = chain.get("current_trait") or "unknown"
+        missing = " ; ".join(chain.get("missing") or []) or "target stats not met"
+        source = chain.get("power_candidate_source") or "unknown"
+        quality = chain.get("power_candidate_quality", "unknown")
+        required = chain.get("power_required_values") or {}
+        return (
+            f" | trigger=power_bad trait={trait} | missing={missing} | "
+            f"source={source} | quality={quality} | required={required}"
+        )
+
     def manual_reroll_flow(self, reason="bad mythical"):
         started = time.perf_counter()
         if self._stop_requested("manual reroll flow"):
@@ -5191,7 +5346,7 @@ class AelrithForgeBot:
             self.set_status("Manual power reroll")
         else:
             self.set_status("Manual reroll flow")
-        self.log(f"Manual reroll flow | {reason_text} | {reroll_context}")
+        self.log(f"Manual reroll flow | {reason_text} | {reroll_context}{self._manual_reroll_power_decision_context()}")
         self._set_recovery_route_snapshot(
             result="pending",
             route_reason="manual_reroll_started",
@@ -5418,6 +5573,43 @@ class AelrithForgeBot:
             ),
         )
         if not changed:
+            support = self._manual_reroll_resume_support(
+                self.last_recovery_verify_details,
+                self.last_recovery_reason,
+                popup_recently_cleared=popup_verified_clear,
+            )
+            if support.get("strong"):
+                self.last_text = support.get("sample_text") or resume_baseline
+                self.last_change = time.time()
+                self.last_manual_reroll_confirmed_at = time.perf_counter()
+                self.last_manual_reroll_confirm_reason = reason_text
+                self._set_recovery_route_snapshot(
+                    result="confirmed",
+                    route_reason="manual_reroll_popup_cleared_refresh_confirmed",
+                    auto_state=str(auto_result or "unknown"),
+                    rolling_confirmed=True,
+                    support_signals=list(support.get("signals") or []),
+                    context="manual_reroll",
+                )
+                self.log(
+                    "Manual reroll auto resume confirmed by popup-cleared roll refresh | "
+                    f"result={auto_result} | reason={support.get('reason', 'none')} | "
+                    f"support={'+'.join(support.get('signals', [])) or 'none'} | "
+                    f"image_changed_samples={support.get('image_changed_samples', 0)} | "
+                    f"change_score={support.get('max_change_score', 0.0)} | {reroll_context}"
+                )
+                self._record_timing_event(
+                    "manual_reroll_auto_resume",
+                    time.perf_counter() - auto_resume_started,
+                    result="popup_cleared_refresh_confirmed",
+                    auto_state=str(auto_result or "unknown"),
+                    domain=self.roll_domain,
+                )
+                self.log(
+                    f"Manual reroll flow complete | {reason_text} | {reroll_context} | "
+                    f"elapsed={int((time.perf_counter() - started) * 1000)}ms"
+                )
+                return finish(True)
             self._set_recovery_route_snapshot(
                 result="failed",
                 route_reason="manual_reroll_verify_did_not_confirm_rolling",
@@ -5428,7 +5620,9 @@ class AelrithForgeBot:
             )
             self.log(
                 "Manual reroll auto resume did not confirm rolling activity; "
-                f"result={auto_result}; not reporting flow complete | {reroll_context}"
+                f"result={auto_result}; reason={support.get('reason', 'none')}; "
+                f"support={'+'.join(support.get('signals', [])) or 'none'}; "
+                f"not reporting flow complete | {reroll_context}"
             )
             self._record_timing_event(
                 "manual_reroll_auto_resume",
@@ -7326,6 +7520,8 @@ class AelrithForgeBot:
     def evaluate_power_trait_with_values(self, power_key, values, text, source_name="merged", passive=None):
         summary = summarize_power_values(power_key, values, passive=passive)
         assigned = self._power_assigned_values(power_key, values, passive)
+        quality = self._power_candidate_quality(power_key, values, text, passive)
+        completeness = self._power_parse_completeness(power_key, values, passive)
 
         if power_key not in self.enabled_powers:
             self.log(f"SKIP {power_display_name(power_key).upper()} | Power disabled")
@@ -7336,12 +7532,41 @@ class AelrithForgeBot:
                 current_trait=power_display_name(power_key),
                 parsed_values=assigned,
                 summary=summary,
+                power_candidate_source=source_name,
+                power_candidate_quality=quality,
+                power_parse_coherent=completeness["coherent"],
+                power_required_values=completeness["required_values"],
             )
             return "DISABLED", power_key, summary, text, ["Power disabled"], False
 
+        if not completeness["coherent"]:
+            self.log(
+                f"POWER BAD gate deferred | trait={power_display_name(power_key)} | source={source_name} | "
+                f"quality={quality} | required={completeness['required_present']}/{completeness['required_total']} | "
+                f"missing_required={', '.join(completeness['missing_required']) or 'none'}"
+            )
+            self.record_decision_chain(
+                subsystem="Classification",
+                classification="ROLLING",
+                classification_reason="supported power parse incomplete; manual reroll deferred",
+                current_trait=power_display_name(power_key),
+                parsed_values=assigned,
+                summary=summary,
+                power_candidate_source=source_name,
+                power_candidate_quality=quality,
+                power_parse_coherent=False,
+                power_required_values=completeness["required_values"],
+                missing_required=list(completeness["missing_required"]),
+            )
+            return "ROLLING", None, "", text, [], False
+
         matched, missing = evaluate_power(power_key, values, self.power_rules, passive=passive)
         score = power_score(power_key, values, self.power_rules, passive=passive)
-        self.log(f"OCR threshold comparison ({source_name}) | assigned={assigned} | targets={self.power_rules[power_key]}")
+        self.log(
+            f"OCR threshold comparison ({source_name}) | assigned={assigned} | "
+            f"targets={self.power_rules[power_key]} | quality={quality} | "
+            f"required={completeness['required_values']}"
+        )
         self.log(f"Found {power_display_name(power_key).upper()} ({source_name}) | Score {score:.2f} | {summary}")
 
         if not missing:
@@ -7354,6 +7579,10 @@ class AelrithForgeBot:
                 parsed_values=assigned,
                 summary=summary,
                 score=score,
+                power_candidate_source=source_name,
+                power_candidate_quality=quality,
+                power_parse_coherent=True,
+                power_required_values=completeness["required_values"],
             )
             return "GOD", power_key, summary, text, list(missing), False
 
@@ -7372,10 +7601,19 @@ class AelrithForgeBot:
                 summary=summary,
                 missing=list(missing),
                 score=score,
+                power_candidate_source=source_name,
+                power_candidate_quality=quality,
+                power_parse_coherent=True,
+                power_required_values=completeness["required_values"],
             )
             return "HIGH_VALUE", power_key, summary, text, [f"Score {score:.2f}"] + list(missing), True
 
         self.log(f"SKIP {power_display_name(power_key).upper()} | {' ; '.join(missing) if missing else 'Required targets not met'}")
+        self.log(
+            f"Power BAD configured miss | trait={power_display_name(power_key)} | "
+            f"missing={' ; '.join(missing) if missing else 'Required targets not met'} | "
+            f"source={source_name} | quality={quality} | required={completeness['required_values']}"
+        )
         self.record_decision_chain(
             subsystem="Classification",
             classification="BAD",
@@ -7386,6 +7624,10 @@ class AelrithForgeBot:
             missing=list(missing),
             score=score,
             near_miss=bool(near),
+            power_candidate_source=source_name,
+            power_candidate_quality=quality,
+            power_parse_coherent=True,
+            power_required_values=completeness["required_values"],
         )
         return "BAD", power_key, summary, text, list(missing), near
 
@@ -9092,6 +9334,16 @@ class AelrithForgeBot:
                     return "stop"
             if state in ("BAD", "DISABLED"):
                 self._record_startup_spec_class("manual-confirm-required suspicion")
+                if self.roll_domain == "powers" and state == "BAD" and not self._confirm_power_bad_before_manual_reroll(
+                    trait,
+                    missing,
+                    context="Startup Power BAD manual reroll",
+                ):
+                    self.log(
+                        "Startup current power BAD was not stable enough for manual reroll; "
+                        "falling back to Initial Auto Start"
+                    )
+                    return "continue"
                 self.log(f"Startup current {self._manual_reroll_target_kind()} is {state}; manual rerolling immediately")
                 self._mark_startup_manual_reroll(fallback=True)
                 if self.manual_reroll_flow(f"startup current {state.lower()} {trait or 'unknown'}"):
@@ -9439,6 +9691,15 @@ class AelrithForgeBot:
                         self._set_terminal_stop_reason(f"High value roll: {display_trait(trait)}")
                         self.set_status(f"HIGH VALUE | {display_trait(trait)}")
                         break
+                    if self.roll_domain == "powers" and state == "BAD" and not self._confirm_power_bad_before_manual_reroll(
+                        trait,
+                        missing,
+                        context="Loop Power BAD manual reroll",
+                    ):
+                        self.set_status("ROLLING | Power BAD confirmation deferred")
+                        if not self._interruptible_sleep(self.cfg["LOOP_DELAY"], "deferred power BAD loop delay"):
+                            break
+                        continue
                     reroll_reason = f"bad power {trait}" if self.roll_domain == "powers" else f"bad {trait}"
                     if not self.manual_reroll_flow(reroll_reason):
                         if self.recovery_failed_should_stop(

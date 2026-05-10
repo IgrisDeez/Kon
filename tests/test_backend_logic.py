@@ -203,6 +203,32 @@ class BackendLogicTests(unittest.TestCase):
     def force_strong_enabled_checkbox(self, bot):
         bot._auto_checkbox_confidence_tier = lambda: "strong_enabled"
 
+    def apply_subjugator_luck_target(self, bot):
+        bot.set_roll_domain("powers")
+        bot.set_power_rules(
+            {
+                "subjugator": [
+                    (0.0, 40.0),
+                    (0.0, 40.0),
+                    (0.0, 3.5),
+                    (0.0, 13.0),
+                    (17.0, 17.5),
+                    (0.0, 20.0),
+                ]
+            }
+        )
+
+    def evaluate_power_text(self, bot, text, source_name="unit"):
+        parsed = bot_module.parse_power_roll_text(text)
+        self.assertIsNotNone(parsed)
+        return bot.evaluate_power_trait_with_values(
+            parsed["power"],
+            parsed["values"],
+            text,
+            source_name=source_name,
+            passive=parsed.get("passive"),
+        )
+
     def test_rules_are_clamped_to_hard_caps(self):
         rules = sanitize_rules(
             {
@@ -1339,6 +1365,56 @@ class BackendLogicTests(unittest.TestCase):
         self.assertTrue(any("Manual reroll auto resume rolling activity confirmed" in message for message in messages))
         self.assertTrue(any("Manual reroll flow complete" in message for message in messages))
 
+    def test_manual_reroll_resume_accepts_popup_cleared_roll_like_image_change(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot.popup_active = lambda *_args, **_kwargs: True
+        bot.clear_reroll_popup = lambda *_args, **_kwargs: True
+        bot.auto_checkbox_state = lambda: "enabled"
+        self.force_strong_enabled_checkbox(bot)
+        bot.click = lambda *_args, **_kwargs: None
+        stats_calls = []
+
+        def fake_stats_changed(baseline, context="", **kwargs):
+            stats_calls.append((context, kwargs))
+            bot.last_recovery_verify_details = {
+                "classification": "not_rolling",
+                "rejection_reason": "readable_insufficient_change",
+                "image_changed_samples": 2,
+                "max_change_score": 17.43,
+                "unreadable": False,
+                "samples_detail": [
+                    {
+                        "cleaned": "infernal critdamage5.1",
+                        "unreliable": False,
+                        "materially_different": True,
+                        "trait_only": False,
+                        "image_changed": True,
+                    },
+                    {
+                        "cleaned": "solid hp4.7 damage2.1",
+                        "unreliable": False,
+                        "materially_different": True,
+                        "trait_only": False,
+                        "image_changed": True,
+                    },
+                ],
+            }
+            bot.last_recovery_reason = "readable_insufficient_change"
+            bot.last_recovery_verify_unreadable = False
+            return False, baseline
+
+        bot.stats_changed = fake_stats_changed
+
+        self.assertTrue(bot.manual_reroll_flow("bad power subjugator"))
+        self.assertEqual(len(stats_calls), 1)
+        self.assertEqual(stats_calls[0][0], "Manual Reroll Auto Resume verify")
+        self.assertFalse(stats_calls[0][1]["candidate_signal_enabled"])
+        self.assertTrue(any("popup-cleared roll refresh" in message for message in messages))
+
     def test_manual_reroll_auto_resume_known_enabled_fails_without_activity_confirmation(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
@@ -1355,6 +1431,48 @@ class BackendLogicTests(unittest.TestCase):
 
         self.assertFalse(bot.manual_reroll_flow("unit bad mythical"))
         self.assertTrue(any("did not confirm rolling activity" in message for message in messages))
+        self.assertFalse(any("Manual reroll flow complete" in message for message in messages))
+
+    def test_manual_reroll_resume_rejects_stale_text_after_popup_clear(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot.popup_active = lambda *_args, **_kwargs: True
+        bot.clear_reroll_popup = lambda *_args, **_kwargs: True
+        bot.auto_checkbox_state = lambda: "enabled"
+        self.force_strong_enabled_checkbox(bot)
+        bot.click = lambda *_args, **_kwargs: None
+
+        def fake_stats_changed(baseline, context="", **kwargs):
+            self.assertEqual(context, "Manual Reroll Auto Resume verify")
+            self.assertFalse(kwargs["candidate_signal_enabled"])
+            bot.last_recovery_verify_details = {
+                "classification": "not_rolling",
+                "rejection_reason": "no_material_change",
+                "image_changed_samples": 0,
+                "max_change_score": 0.0,
+                "unreadable": False,
+                "samples_detail": [
+                    {
+                        "cleaned": "subjugator luck9.4 critdamage10.2",
+                        "unreliable": False,
+                        "materially_different": False,
+                        "trait_only": False,
+                        "image_changed": False,
+                    }
+                ],
+            }
+            bot.last_recovery_reason = "no_material_change"
+            bot.last_recovery_verify_unreadable = False
+            return False, baseline
+
+        bot.stats_changed = fake_stats_changed
+
+        self.assertFalse(bot.manual_reroll_flow("bad power subjugator"))
+        self.assertTrue(any("reason=no_material_change" in message for message in messages))
+        self.assertFalse(any("popup-cleared roll refresh" in message for message in messages))
         self.assertFalse(any("Manual reroll flow complete" in message for message in messages))
 
     def test_powers_manual_reroll_flow_uses_active_powers_button_coordinates(self):
@@ -1417,6 +1535,117 @@ class BackendLogicTests(unittest.TestCase):
         self.assertTrue(any("domain=powers target=power" in message for message in messages))
         self.assertFalse(any("bad mythical" in message for message in messages))
 
+    def test_power_bad_requires_coherent_required_parse(self):
+        messages = []
+        bot = StubBot(
+            [
+                (
+                    "partial-power",
+                    "Subjugator Damage36.8 CritChance2.8 Luck9.4",
+                    "Subjugator Damage36.8 CritChance2.8 Luck9.4",
+                )
+            ]
+        )
+        bot.log = messages.append
+        self.apply_subjugator_luck_target(bot)
+
+        state, trait, summary, _text, missing, near = bot.check_roll()
+
+        self.assertEqual(state, "ROLLING")
+        self.assertIsNone(trait)
+        self.assertEqual(summary, "")
+        self.assertEqual(missing, [])
+        self.assertFalse(near)
+        self.assertFalse(bot.last_decision_chain.get("power_parse_coherent"))
+        self.assertTrue(any("POWER BAD gate deferred" in message for message in messages))
+
+    def test_power_bad_confirmation_accepts_stable_configured_miss(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        self.apply_subjugator_luck_target(bot)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        text = "Subjugator NPC Slow 20% 5s Damage 36.8 Crit Chance 2.8 Luck 9.4 HP 34.4 Crit Damage 10.2"
+        state, trait, _summary, _ocr_text, missing, _near = self.evaluate_power_text(bot, text, "initial")
+        bot.check_roll = lambda allow_fallback=True, startup_fast=False: self.evaluate_power_text(bot, text, "confirm")
+
+        self.assertEqual(state, "BAD")
+        self.assertTrue(bot._confirm_power_bad_before_manual_reroll(trait, missing, context="Unit Power BAD manual reroll"))
+        self.assertTrue(any("Unit Power BAD manual reroll confirmed" in message for message in messages))
+
+    def test_power_manual_reroll_start_log_includes_configured_miss_context(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        self.apply_subjugator_luck_target(bot)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        text = "Subjugator NPC Slow 20% 5s Damage 36.8 Crit Chance 2.8 Luck 9.4 HP 34.4 Crit Damage 10.2"
+        state, trait, _summary, _ocr_text, missing, _near = self.evaluate_power_text(bot, text, "initial")
+        self.assertEqual(state, "BAD")
+        self.assertEqual(trait, "subjugator")
+        self.assertIn("Luck: 9.4 -> 17-17.5", missing)
+        bot.popup_active = lambda *_args, **_kwargs: True
+        bot.clear_reroll_popup = lambda *_args, **_kwargs: True
+        bot.auto_checkbox_state = lambda: "enabled"
+        self.force_strong_enabled_checkbox(bot)
+        bot.click = lambda *_args, **_kwargs: None
+        bot.stats_changed = lambda *_args, **_kwargs: (True, "infernal critdamage5.1")
+
+        self.assertTrue(bot.manual_reroll_flow("bad power subjugator"))
+        start_logs = [message for message in messages if message.startswith("Manual reroll flow | bad power subjugator")]
+        self.assertTrue(start_logs)
+        self.assertIn("trigger=power_bad trait=Subjugator", start_logs[-1])
+        self.assertIn("Luck: 9.4 -> 17-17.5", start_logs[-1])
+        self.assertIn("source=initial", start_logs[-1])
+
+    def test_power_bad_confirmation_rejects_changed_values(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        self.apply_subjugator_luck_target(bot)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        initial = "Subjugator NPC Slow 20% 5s Damage 36.8 Crit Chance 2.8 Luck 9.4 HP 34.4 Crit Damage 10.2"
+        changed = "Subjugator NPC Slow 20% 5s Damage 36.8 Crit Chance 2.8 Luck 10.4 HP 34.4 Crit Damage 10.2"
+        state, trait, _summary, _ocr_text, missing, _near = self.evaluate_power_text(bot, initial, "initial")
+        bot.check_roll = lambda allow_fallback=True, startup_fast=False: self.evaluate_power_text(bot, changed, "confirm")
+
+        self.assertEqual(state, "BAD")
+        self.assertFalse(bot._confirm_power_bad_before_manual_reroll(trait, missing, context="Unit Power BAD manual reroll"))
+        self.assertTrue(any("Unit Power BAD manual reroll rejected" in message for message in messages))
+
+    def test_loop_manual_reroll_runs_after_stable_power_bad_confirmation(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        self.apply_subjugator_luck_target(bot)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["STARTUP_DELAY"] = 0.0
+        bot.cfg["LOOP_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: not bot.stop_event.is_set()
+        bot.startup_check_current_roll = lambda: "rerolled"
+        bot.start_live_status = lambda *_args, **_kwargs: True
+        bot.finish_live_status = lambda *_args, **_kwargs: True
+        bot.maybe_update_live_status = lambda *_args, **_kwargs: True
+        bot.maybe_report_passive_shards = lambda force=False: None
+        bot.maybe_report_power_shards = lambda force=False: None
+        bot.should_check_passive_shards_empty = lambda _count: False
+        bot.should_check_power_shards_empty = lambda _count: False
+        text = "Subjugator NPC Slow 20% 5s Damage 36.8 Crit Chance 2.8 Luck 9.4 HP 34.4 Crit Damage 10.2"
+        bot.check_roll = lambda allow_fallback=True, startup_fast=False: self.evaluate_power_text(bot, text, "loop")
+        manual_calls = []
+
+        def manual_reroll(reason=""):
+            manual_calls.append(reason)
+            bot.stop_event.set()
+            return True
+
+        bot.manual_reroll_flow = manual_reroll
+
+        bot.loop()
+
+        self.assertEqual(manual_calls, ["bad power subjugator"])
+        self.assertTrue(any("Loop Power BAD manual reroll confirmed" in message for message in messages))
+
     def test_powers_startup_bad_current_power_trusts_strong_fast_probe(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
@@ -1426,6 +1655,20 @@ class BackendLogicTests(unittest.TestCase):
 
         def fake_check_roll(*args, **kwargs):
             calls.append(kwargs)
+            bot.record_decision_chain(
+                subsystem="Classification",
+                classification="BAD",
+                current_trait="Colossus",
+                power_parse_coherent=True,
+                power_candidate_quality=151,
+                power_required_values={
+                    "Damage": 22.2,
+                    "Crit Chance": 1.8,
+                    "Crit Damage": 7.6,
+                    "Luck": 14.6,
+                    "Boss damage bonus": 23.4,
+                },
+            )
             return (
                 "BAD",
                 "colossus",
@@ -1441,9 +1684,10 @@ class BackendLogicTests(unittest.TestCase):
         bot.stats_changed = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed reroll should not verify"))
 
         self.assertEqual(bot.startup_check_current_roll(), "failed")
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertTrue(calls[0].get("startup_fast"))
         self.assertEqual(manual_calls, ["startup current bad colossus"])
+        self.assertTrue(any("Startup Power BAD manual reroll confirmed" in message for message in messages))
         self.assertTrue(any("strategy=trusted_startup_fast_power_probe" in message for message in messages))
         self.assertTrue(any("skipping slower full current-spec scan" in message for message in messages))
 
@@ -3151,6 +3395,46 @@ class BackendLogicTests(unittest.TestCase):
             self.assertIsNotNone(backup)
             self.assertTrue(Path(backup).exists())
             self.assertEqual(saved, json.loads(json.dumps(controller.settings)))
+
+    def test_safe_power_settings_backup_excludes_secrets_and_preserves_power_layout(self):
+        with TemporaryDirectory() as temp_dir, controller_storage(temp_dir):
+            controller = BotController()
+            settings = controller.normalize_settings(default_settings())
+            settings.update(
+                {
+                    "roll_domain": "powers",
+                    "webhook_url": "https://discord.example/api/webhooks/id/token",
+                    "player_ping": "@player",
+                    "power_shard_region": "10,20,30,40",
+                    "powers_layout": {
+                        "stats_region": "100,100,300,80",
+                        "current_power_region": "100,100,300,80",
+                        "preview_region": "200,200,260,70",
+                        "auto_check_region": "300,300,40,40",
+                        "confirm_check_region": "400,400,120,40",
+                        "popup_region": "500,500,180,90",
+                        "protected_region": "600,600,190,95",
+                        "change_detection_exclusion_region": "600,600,190,95",
+                        "coords": {"auto": "101,202", "roll": "303,404", "yes": "505,606"},
+                    },
+                }
+            )
+            controller.apply_settings(settings, save=False, announce=False)
+            backup_path = Path(temp_dir) / "powers_backup.json"
+
+            saved_path = controller.save_power_settings_backup(backup_path)
+            backup = json.loads(saved_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(set(backup), {"roll_domain", "powers_layout", "enabled_powers", "powers_rules", "power_shard_region"})
+            self.assertEqual(backup["roll_domain"], "powers")
+            self.assertEqual(backup["power_shard_region"], "10,20,30,40")
+            self.assertEqual(backup["powers_layout"]["current_power_region"], "100,100,300,80")
+            self.assertEqual(backup["powers_layout"]["preview_region"], "200,200,260,70")
+            self.assertEqual(backup["powers_layout"]["coords"]["yes"], "505,606")
+            serialized = json.dumps(backup)
+            self.assertNotIn("webhook", serialized.lower())
+            self.assertNotIn("discord.example", serialized)
+            self.assertNotIn("@player", serialized)
 
     def test_ocr_debug_file_records_parse_details(self):
         old_debug_log = bot_module.OCR_DEBUG_LOG_FILE

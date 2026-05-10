@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.100.9
+
+- Confirmed manual reroll resume after a cleared popup when Auto resume produces image change plus readable roll-like OCR, without accepting stale text alone.
+- Disabled slow multi-source OCR fallback in manual reroll resume verification to reduce startup reroll delay.
+- Hardened the Windows batch launcher so it prefers a local venv or `py -3`, checks dependencies, and offers to install missing requirements before launch.
+- Added diagnostics/tests for Powers BAD reroll context, popup-cleared resume confirmation, stale resume rejection, and fast verify settings.
+
+## v1.100.8
+
+- Saved a sanitized local Powers settings backup without webhook or player-identifying fields.
+- Required coherent, stable Powers BAD confirmation before entering manual reroll so weak or changing OCR does not click confirmation.
+- Added Powers BAD confirmation, settings backup, and parser stability regressions.
+
 ## v1.100.7
 
 - Hardened startup and watchdog recovery so weak stale OCR and ambiguous Auto checkbox reads no longer fake-confirm rolling or trigger blind clicks.

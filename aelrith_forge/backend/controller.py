@@ -581,6 +581,22 @@ class BotController(QObject):
         if announce:
             self._bot_log("Settings applied.")
 
+    def safe_power_settings_snapshot(self, settings: dict | None = None) -> dict:
+        data = self.normalize_settings(settings or self.settings)
+        return {
+            "roll_domain": data.get("roll_domain"),
+            "powers_layout": data.get("powers_layout"),
+            "enabled_powers": data.get("enabled_powers"),
+            "powers_rules": data.get("powers_rules"),
+            "power_shard_region": data.get("power_shard_region"),
+        }
+
+    def save_power_settings_backup(self, path: Path | None = None) -> Path:
+        backup_path = Path(path) if path is not None else SETTINGS_FILE.parent / f"powers_settings_backup_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        backup_path.write_text(json.dumps(self.safe_power_settings_snapshot(), indent=2), encoding="utf-8")
+        return backup_path
+
     def start(self, settings: dict):
         if self.bot.running:
             self._bot_log("The bot is already running.")
