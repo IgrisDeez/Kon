@@ -465,7 +465,7 @@ class BotController(QObject):
         enabled_specs = set()
         enabled = data.get("enabled_specs") or {}
         if enabled.get("fortune_chosen", True):
-            enabled_specs.update({"fortune", "chosen"})
+            enabled_specs.add("fortune")
         if enabled.get("executioner", True):
             enabled_specs.add("executioner")
         if enabled.get("rampage", True):

@@ -85,9 +85,15 @@ ensure_app_dirs()
 ARTIFACT_VERSION_PREFIX = re.sub(r"[^a-zA-Z0-9._-]+", "_", APP_VERSION)
 OCR_DEBUG_LOG_FILE = build_ocr_debug_log_file(ARTIFACT_VERSION_PREFIX)
 
+SUPPORTED_SPEC_TRAITS = ("fortune", "executioner", "rampage")
+LEGACY_SPEC_TRAIT_ALIASES = {
+    "chosen": "fortune",
+    "fortune_chosen": "fortune",
+    "fortune chosen": "fortune",
+}
+
 TRAIT_ALIASES = {
-    "fortune": ["fortune", "fortu", "urtune", "furtune", "borturne"],
-    "chosen": ["chosen", "chosem", "lhosen", "lhoser"],
+    "fortune": ["fortune chosen", "fortunechosen", "fortune", "fortu", "urtune", "furtune", "borturne", "chosen", "chosem", "lhosen", "lhoser"],
     "executioner": ["executioner", "executione", "xecutioner", "execut", "lxecut", "edee"],
     "rampage": ["rampage", "ranpage", "fanpage", "ra mpage", "rarnpage", "rgxaga", "rxaga", "ragaga"],
 }
@@ -110,9 +116,9 @@ TYPO_MAP = {
     "fortu": "fortune",
     "urtune": "fortune",
     "furtune": "fortune",
-    "lhosen": "chosen",
-    "lhoser": "chosen",
-    "chosem": "chosen",
+    "lhosen": "fortune",
+    "lhoser": "fortune",
+    "chosem": "fortune",
     "edee": "executioner",
     "lxecut": "executioner",
     "execut": "executioner",
@@ -171,6 +177,19 @@ TYPO_MAP = {
     "ruzaga": "rampage",
     "cobo": "combo",
 }
+
+
+def canonical_spec_trait(trait: str | None) -> str | None:
+    if not trait:
+        return None
+    key = normalize_ocr_text(str(trait)).replace(" ", "_")
+    if key in SUPPORTED_SPEC_TRAITS:
+        return key
+    return LEGACY_SPEC_TRAIT_ALIASES.get(key)
+
+
+def is_supported_spec_trait(trait: str | None) -> bool:
+    return canonical_spec_trait(trait) in SUPPORTED_SPEC_TRAITS
 
 DEFAULT_REAL_RULES = {
     "fortune": [(29.0, 30.0), (9.0, 10.0)],
@@ -460,7 +479,7 @@ def detect_trait(text: str):
     normalized = normalize_text(text)
     for trait, aliases in TRAIT_ALIASES.items():
         if any(alias in normalized for alias in aliases):
-            return trait
+            return canonical_spec_trait(trait)
     words = re.findall(r"[a-z]{4,}", normalized)
     aliases = {
         alias: trait
@@ -473,7 +492,7 @@ def detect_trait(text: str):
             continue
         match = difflib.get_close_matches(word, aliases.keys(), n=1, cutoff=0.72)
         if match:
-            return aliases[match[0]]
+            return canonical_spec_trait(aliases[match[0]])
     return None
 
 
@@ -507,7 +526,7 @@ def _current_spec_title_text(text: str):
 
 
 def detect_rollable_non_target_trait(text: str):
-    return _detect_alias_trait(_current_spec_title_text(text), ROLLABLE_NON_TARGET_TRAIT_ALIASES)
+    return "non_target" if _detect_alias_trait(_current_spec_title_text(text), ROLLABLE_NON_TARGET_TRAIT_ALIASES) else None
 
 
 def detect_rollable_trait(text: str):
@@ -682,7 +701,9 @@ def migrate_rampage_ranges(trait_ranges):
 
 def sanitize_rules(rules):
     clean = {}
-    rules = rules or {}
+    rules = dict(rules or {})
+    if "chosen" in rules and "fortune" not in rules:
+        rules["fortune"] = rules["chosen"]
     for trait, defaults in DEFAULT_REAL_RULES.items():
         trait_ranges = list(rules.get(trait, defaults) or defaults)
         if trait == "rampage":
@@ -732,7 +753,7 @@ class AelrithForgeBot:
         self.last_text = ""
         self.last_change = time.time()
         self.roll_domain = "specs"
-        self.enabled_specs = {"fortune", "chosen", "executioner", "rampage"}
+        self.enabled_specs = set(SUPPORTED_SPEC_TRAITS)
         power_defaults = default_power_settings()
         self.enabled_powers = {key for key, enabled in power_defaults["enabled_powers"].items() if enabled}
         self.power_rules = sanitize_power_rules(power_defaults["powers_rules"])
@@ -1214,7 +1235,11 @@ class AelrithForgeBot:
         self.log(f"Mode set to {mode.upper()}")
 
     def set_enabled_specs(self, enabled_specs):
-        self.enabled_specs = set(enabled_specs or [])
+        self.enabled_specs = {
+            canonical
+            for canonical in (canonical_spec_trait(trait) for trait in (enabled_specs or []))
+            if canonical in SUPPORTED_SPEC_TRAITS
+        }
 
     def set_roll_domain(self, roll_domain: str):
         domain = str(roll_domain or "specs").strip().lower()
@@ -2088,7 +2113,8 @@ class AelrithForgeBot:
     def is_target_trait(self, trait):
         if self.roll_domain == "powers":
             return bool(trait and trait in SUPPORTED_POWER_DEFINITIONS and trait in self.power_rules)
-        return bool(trait and trait in STAT_LABELS and trait in self.rules)
+        trait = canonical_spec_trait(trait)
+        return bool(trait and trait in SUPPORTED_SPEC_TRAITS and trait in self.rules)
 
     def is_rollable_non_target_trait(self, trait):
         return bool(trait and not self.is_target_trait(trait))
@@ -2099,14 +2125,14 @@ class AelrithForgeBot:
     def _generic_trait_word_is_stat_fragment(self, word):
         return _ocr_word_is_stat_fragment(word)
 
-    def _generic_rollable_non_target_from_text(self, text):
+    def _unsupported_trait_hint_from_text(self, text):
         cleaned = normalize_text(text)
         if not self.has_current_spec_marker(cleaned):
-            return None
+            return ""
         numbers = extract_numbers(cleaned)
         has_roll_signal = bool(numbers or self._has_activity_stat_signal(cleaned))
         if not has_roll_signal:
-            return None
+            return ""
         compact = re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
         compact = re.sub(
             r"\b(?:current|curent|curren|cument|spee|spec|specs|trait|passive|stats?)\b",
@@ -2121,8 +2147,14 @@ class AelrithForgeBot:
             if not self._generic_trait_word_is_stat_fragment(word)
         ]
         if raw_words and not words:
-            return None
+            return ""
         return words[0] if words else "non_target"
+
+    def _generic_rollable_non_target_from_text(self, text):
+        hint = self._unsupported_trait_hint_from_text(text)
+        if not hint:
+            return None
+        return "non_target"
 
     def _reroll_popup_signal(self, text):
         cleaned = normalize_text(text)
@@ -6537,9 +6569,10 @@ class AelrithForgeBot:
         return finalized
 
     def extract_labeled_values(self, trait, text, return_debug=False):
+        trait = canonical_spec_trait(trait) or trait
         row_values, debug = self._extract_labeled_values_by_rows(trait, text)
 
-        if trait in ("fortune", "chosen"):
+        if trait == "fortune":
             t = normalize_text(text)
             drop = self._search_value(
                 t,
@@ -6809,6 +6842,7 @@ class AelrithForgeBot:
         return " | ".join(parts)
 
     def merge_labeled_values(self, trait, easy_values=None, psm6_values=None):
+        trait = canonical_spec_trait(trait) or trait
         easy_values = list(easy_values or [])
         psm6_values = list(psm6_values or [])
 
@@ -6817,7 +6851,7 @@ class AelrithForgeBot:
             v2 = secondary[i] if i < len(secondary) else None
             return v1 if v1 is not None else v2
 
-        if trait in ("fortune", "chosen"):
+        if trait == "fortune":
             return [
                 pick(0, easy_values, psm6_values),
                 pick(1, easy_values, psm6_values),
@@ -7328,6 +7362,19 @@ class AelrithForgeBot:
             return ""
 
     def evaluate_trait_with_values(self, trait, labeled_values, text, source_name="merged", parse_debug=None):
+        original_trait = trait
+        trait = canonical_spec_trait(trait)
+        if trait not in SUPPORTED_SPEC_TRAITS:
+            self.log(
+                "unsupported_trait_autoskip | "
+                f"trait={display_trait(original_trait) if original_trait else 'unknown'} | source={source_name}"
+            )
+            return self.evaluate_rollable_non_target_trait(
+                "non_target",
+                text,
+                source_name=source_name,
+                parse_debug=parse_debug,
+            )
         actual_summary = self.build_actual_roll_summary(trait, [], labeled_values)
 
         if trait not in self.enabled_specs:
@@ -7407,17 +7454,23 @@ class AelrithForgeBot:
         return "BAD", trait, actual_summary, text, missing, near
 
     def evaluate_rollable_non_target_trait(self, trait, text, source_name="merged", parse_debug=None):
-        summary = f"{display_trait(trait)} is rollable non-target filler"
-        self.log(f"ROLLABLE NON-TARGET | {display_trait(trait)} ({source_name}) | safe to reroll")
+        unsupported_hint = (parse_debug or {}).get("unsupported_trait") or self._unsupported_trait_hint_from_text(text)
+        summary = "Unsupported/filler trait is safe to autoskip"
+        if unsupported_hint and unsupported_hint != "non_target":
+            summary = f"Unsupported/filler trait ({unsupported_hint}) is safe to autoskip"
+        self.log(
+            "unsupported_trait_autoskip | "
+            f"trait={unsupported_hint or display_trait(trait)} | source={source_name} | safe to reroll"
+        )
         self.record_decision_chain(
             subsystem="Classification",
             classification="NON_TARGET",
-            classification_reason="recognized legitimate rollable trait outside active keeper targets",
-            current_trait=display_trait(trait),
+            classification_reason="unsupported_trait_autoskip",
+            current_trait="Non-target Roll",
             parsed_values=(parse_debug or {}).get("assigned_values", {}),
             summary=summary,
         )
-        return "NON_TARGET", trait, summary, text, ["Non-target trait"], False
+        return "NON_TARGET", "non_target", summary, text, ["Unsupported trait autoskip"], False
 
     def _candidate_parse_quality(self, trait, text, values, debug):
         found = sum(1 for value in values if value is not None)
@@ -7569,9 +7622,14 @@ class AelrithForgeBot:
             if rollable_non_target and rollable_source:
                 engine, text, raw_text = rollable_source
                 has_marker = self.has_current_spec_marker(text) or self.has_current_spec_marker(raw_text)
+                unsupported_hint = (
+                    self._unsupported_trait_hint_from_text(text)
+                    or self._unsupported_trait_hint_from_text(raw_text)
+                    or "non_target"
+                )
                 self.log(
-                    "Recognized rollable non-target trait | "
-                    f"trait={display_trait(rollable_non_target)} | source={engine} | "
+                    "unsupported_trait_autoskip | "
+                    f"trait={unsupported_hint} | source={engine} | "
                     f"marker={'yes' if has_marker else 'no'}"
                 )
                 result = {
@@ -7584,6 +7642,7 @@ class AelrithForgeBot:
                         "parse_errors": [],
                         "parse_warnings": [],
                         "rollability": "non_target",
+                        "unsupported_trait": unsupported_hint,
                     },
                     "source_text": text,
                     "source_name": engine,
@@ -7676,9 +7735,14 @@ class AelrithForgeBot:
             )
             if rollable_non_target and rollable_non_target != trait:
                 has_marker = self.has_current_spec_marker(best_fragment["text"]) or self.has_current_spec_marker(best_fragment["raw_text"])
+                unsupported_hint = (
+                    self._unsupported_trait_hint_from_text(best_fragment["text"])
+                    or self._unsupported_trait_hint_from_text(best_fragment["raw_text"])
+                    or "non_target"
+                )
                 self.log(
-                    "Rampage-like fragment resolved as rollable non-target | "
-                    f"trait={display_trait(rollable_non_target)} | source={best_fragment['engine']}"
+                    "Rampage-like fragment resolved as unsupported trait autoskip | "
+                    f"trait={unsupported_hint} | source={best_fragment['engine']}"
                 )
                 result = {
                     "trait": rollable_non_target,
@@ -7690,6 +7754,7 @@ class AelrithForgeBot:
                         "parse_errors": [],
                         "parse_warnings": [],
                         "rollability": "non_target",
+                        "unsupported_trait": unsupported_hint,
                     },
                     "source_text": best_fragment["text"],
                     "source_name": best_fragment["engine"],

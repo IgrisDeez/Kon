@@ -35,8 +35,20 @@ def test_detect_trait_rampage_ocr_aliases(raw, expected):
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("Current Spec Dead Eye Damage 1", "deadeye"),
-        ("Current Spec Vigor HP 1", "vigor"),
+        ("Current Spec Fortune Chosen Drop 29.5 Luck 9.5", "fortune"),
+        ("Current Spec Chosen Drop 29.5 Luck 9.5", "fortune"),
+        ("Current Spec Executioner NPC DMG 44 Crit Chance 2 Crit Damage 10", "executioner"),
+    ],
+)
+def test_detect_trait_supported_allowlist(raw, expected):
+    assert detect_trait(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Current Spec Dead Eye Damage 1", "non_target"),
+        ("Current Spec Vigor HP 1", "non_target"),
     ],
 )
 def test_detect_rollable_non_target_trait(raw, expected):
@@ -69,10 +81,24 @@ def test_detect_trait_rejects_glued_stat_fragments(raw):
     assert detect_trait(raw) is None
 
 
-def test_generic_non_target_preserves_legitimate_unknown_traits():
+def test_generic_non_target_redacts_unsupported_trait_names():
     bot = AelrithForgeBot(lambda *_: None, lambda *_: None)
 
-    assert bot._generic_rollable_non_target_from_text("Current Spec Frostborn Damage 12.5") == "frostborn"
+    assert bot._generic_rollable_non_target_from_text("Current Spec Frostborn Damage 12.5") == "non_target"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Current Spec Dead Eye Damage 1",
+        "Current Spec Vigor HP 1",
+        "Current Spec Monarch Damage 1",
+        "Current Spec Blitz Damage 1",
+        "Current Spec Frostborn Damage 12.5",
+    ],
+)
+def test_unsupported_traits_do_not_detect_as_supported(raw):
+    assert detect_trait(raw) is None
 
 
 @pytest.mark.parametrize(

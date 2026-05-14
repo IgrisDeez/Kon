@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.100.20
+
+- Restricted Specs trait detection to the supported Mythical allowlist: Fortune Chosen, Executioner, and Rampage.
+- Normalized legacy `chosen` settings into Fortune Chosen while preventing unsupported traits from becoming actionable targets.
+- Added regressions proving unsupported traits autoskip without keep, stop, near-miss, or Discord alert behavior.
+
 ## v1.100.19
 
 - Sent near-miss Discord alerts through an explicit raw Markdown path and logged the v2 clean format before delivery.

@@ -1214,10 +1214,10 @@ class BackendLogicTests(unittest.TestCase):
         bot.banner_active = lambda: False
         bot.check_roll = lambda *args, **kwargs: (
             "NON_TARGET",
-            "vigor",
-            "Vigor is rollable non-target filler",
+            "non_target",
+            "Unsupported/filler trait (vigor) is safe to autoskip",
             "current spec vigor damage 5.0 range 3.0",
-            ["Non-target trait"],
+            ["Unsupported trait autoskip"],
             False,
         )
         manual_calls = []
@@ -1227,7 +1227,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(bot.startup_check_current_roll(), "continue")
         self.assertEqual(manual_calls, [])
         self.assertEqual(bot.last_startup_result, "")
-        self.assertTrue(any("Startup fast current-spec probe | state=NON_TARGET trait=Vigor" in message for message in messages))
+        self.assertTrue(any("Startup fast current-spec probe | state=NON_TARGET trait=Non-target Roll" in message for message in messages))
         self.assertTrue(any("accepted strong NON_TARGET filler evidence" in message for message in messages))
         self.assertFalse(any("manual rerolling immediately" in message for message in messages))
 
@@ -1235,10 +1235,10 @@ class BackendLogicTests(unittest.TestCase):
         bot = RecoveryFallbackStubBot(
             (
                 "NON_TARGET",
-                "vigor",
-                "Vigor is rollable non-target filler",
+                "non_target",
+                "Unsupported/filler trait (vigor) is safe to autoskip",
                 "current spec vigor damage 5.0 range 3.0",
-                ["Non-target trait"],
+                ["Unsupported trait autoskip"],
                 False,
             )
         )
@@ -2780,7 +2780,7 @@ class BackendLogicTests(unittest.TestCase):
     def test_extracts_fortune_chosen_when_labels_are_glued_to_values(self):
         bot = self.make_bot()
         values = bot.extract_labeled_values(
-            "chosen",
+            "fortune",
             "fortunechosen 28.0 chance 1drop. damarge10.3 .luck5.2",
         )
         self.assertEqual(values, [28.0, 5.2])
@@ -3699,7 +3699,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(missing, [])
         self.assertFalse(near)
 
-    def test_check_roll_classifies_legitimate_non_target_as_rollable_filler(self):
+    def test_check_roll_classifies_unsupported_trait_as_autoskip_filler(self):
         bot = StubBot(
             [
                 (
@@ -3711,11 +3711,11 @@ class BackendLogicTests(unittest.TestCase):
         )
         state, trait, summary, _text, missing, near = bot.check_roll()
         self.assertEqual(state, "NON_TARGET")
-        self.assertEqual(trait, "vigor")
-        self.assertIn("rollable non-target", summary)
-        self.assertEqual(missing, ["Non-target trait"])
+        self.assertEqual(trait, "non_target")
+        self.assertIn("Unsupported/filler trait", summary)
+        self.assertEqual(missing, ["Unsupported trait autoskip"])
         self.assertFalse(near)
-        self.assertTrue(any("ROLLABLE NON-TARGET" in message for message in bot.messages))
+        self.assertTrue(any("unsupported_trait_autoskip" in message for message in bot.messages))
 
     def test_generic_current_spec_non_target_is_rollable_without_target_thresholds(self):
         bot = StubBot(
@@ -3729,8 +3729,32 @@ class BackendLogicTests(unittest.TestCase):
         )
         state, trait, summary, _text, _missing, _near = bot.check_roll()
         self.assertEqual(state, "NON_TARGET")
-        self.assertEqual(trait, "phantom")
-        self.assertIn("Phantom", summary)
+        self.assertEqual(trait, "non_target")
+        self.assertIn("phantom", summary)
+
+    def test_unsupported_trait_names_never_trigger_alert_or_stop_classifications(self):
+        unsupported_samples = [
+            ("Dead Eye", "CURRENT SPEC Dead Eye Damage 30 Crit Chance 4 Crit Damage 15"),
+            ("Vigor", "CURRENT SPEC Vigor Damage 30 Crit Chance 4 Crit Damage 15"),
+            ("Monarch", "CURRENT SPEC Monarch Damage 30 Crit Chance 4 Crit Damage 15"),
+            ("Blitz", "CURRENT SPEC Blitz Damage 30 Crit Chance 4 Crit Damage 15"),
+            ("Frostborn", "CURRENT SPEC Frostborn Damage 30 Crit Chance 4 Crit Damage 15"),
+        ]
+        for label, raw in unsupported_samples:
+            with self.subTest(label=label):
+                bot = StubBot([("tesseract-test", raw.lower(), raw)])
+                bot.send_webhook = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unsupported trait sent god alert"))
+                bot.send_near_miss_alert = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unsupported trait sent near-miss alert"))
+                bot.on_god_roll = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unsupported trait recorded god roll"))
+                bot.on_near_miss = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unsupported trait recorded near miss"))
+
+                state, trait, summary, _text, missing, near = bot.check_roll()
+
+                self.assertEqual(state, "NON_TARGET")
+                self.assertEqual(trait, "non_target")
+                self.assertIn("Unsupported/filler trait", summary)
+                self.assertEqual(missing, ["Unsupported trait autoskip"])
+                self.assertFalse(near)
 
     def test_non_target_without_current_spec_marker_is_rejected_as_unreliable(self):
         bot = StubBot(
@@ -3747,7 +3771,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertIsNone(trait)
         self.assertEqual(summary, "")
 
-    def test_future_target_expansion_can_promote_rollable_trait(self):
+    def test_non_allowlisted_trait_cannot_be_promoted_by_rules(self):
         bot = self.make_bot()
         self.assertFalse(bot.is_target_trait("deadeye"))
         old_labels = bot_module.STAT_LABELS.get("deadeye")
@@ -3757,7 +3781,7 @@ class BackendLogicTests(unittest.TestCase):
             bot_module.STAT_CAPS["deadeye"] = [10.0]
             bot.rules["deadeye"] = [(5.0, 10.0)]
             bot.enabled_specs.add("deadeye")
-            self.assertTrue(bot.is_target_trait("deadeye"))
+            self.assertFalse(bot.is_target_trait("deadeye"))
         finally:
             if old_labels is None:
                 bot_module.STAT_LABELS.pop("deadeye", None)
@@ -3768,6 +3792,14 @@ class BackendLogicTests(unittest.TestCase):
             else:
                 bot_module.STAT_CAPS["deadeye"] = old_caps
             bot.rules.pop("deadeye", None)
+
+    def test_chosen_enabled_spec_normalizes_to_fortune_only(self):
+        bot = self.make_bot()
+        bot.set_enabled_specs({"chosen", "deadeye", "executioner"})
+
+        self.assertEqual(bot.enabled_specs, {"fortune", "executioner"})
+        self.assertTrue(bot.is_target_trait("chosen"))
+        self.assertEqual(bot_module.detect_trait("Current Spec Chosen Drop 29.5 Luck 9.5"), "fortune")
 
     def test_markerless_strong_partial_rampage_read_is_accepted(self):
         bot = StubBot(
