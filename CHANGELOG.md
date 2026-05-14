@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.100.19
+
+- Sent near-miss Discord alerts through an explicit raw Markdown path and logged the v2 clean format before delivery.
+- Stopped watchdog recovery from confirming rolling from repeated garbage/control OCR after an Auto re-enable attempt.
+- Added off-target current-roll OCR diagnostics when the stats region reads UI text such as `orCode`, `OCRPass`, or `StartPowers`.
+
 ## v1.100.18
 
 - Reformatted Discord near-miss alerts into a cleaner Markdown summary for Specs and Powers rolls.

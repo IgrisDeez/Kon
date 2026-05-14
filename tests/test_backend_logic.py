@@ -372,6 +372,50 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(sample, "ve ore")
         self.assertTrue(any("stats_ocr_unreliable_after_ui_flow" in message for message in bot.messages))
 
+    def test_watchdog_rejects_repeated_control_text_after_auto_reenable(self):
+        bot = ActivityStubBot(["orCode:279", "OCRPass", "StartPowers"])
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot._ocr_tesseract_image = lambda _image, psm=7: bot.ocr_region(None, psm=psm)
+        old_pyautogui = bot_module.pyautogui
+        try:
+            bot_module.pyautogui = None
+            changed, returned = bot.stats_changed(
+                "orCode:279",
+                context="Unexpected No-Roll Watchdog verify",
+                ui_signals=["watchdog_auto_reenable"],
+                polls_override=3,
+                poll_delay_override=0.0,
+            )
+        finally:
+            bot_module.pyautogui = old_pyautogui
+
+        self.assertFalse(changed)
+        self.assertEqual(returned, "orCode:279")
+        self.assertEqual(bot.last_recovery_verify_state, "not_rolling")
+        self.assertEqual(bot.last_recovery_reason, "stats_region_off_target_ui_text")
+        self.assertTrue(any("Current roll OCR region appears misconfigured" in message for message in bot.messages))
+        self.assertFalse(any("stats_ocr_unreliable_after_ui_flow:watchdog_auto_reenable" in message for message in bot.messages))
+
+    def test_watchdog_rejects_unreliable_non_control_text_after_auto_reenable(self):
+        bot = ActivityStubBot(["ve ore", "", "ve ore"])
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot._ocr_tesseract_image = lambda _image, psm=7: bot.ocr_region(None, psm=psm)
+        old_pyautogui = bot_module.pyautogui
+        try:
+            bot_module.pyautogui = None
+            changed, _returned = bot.stats_changed(
+                "ve ore",
+                context="Unexpected No-Roll Watchdog verify",
+                ui_signals=["watchdog_auto_reenable"],
+                polls_override=3,
+                poll_delay_override=0.0,
+            )
+        finally:
+            bot_module.pyautogui = old_pyautogui
+
+        self.assertFalse(changed)
+        self.assertEqual(bot.last_recovery_reason, "stats_ocr_unreliable_after_watchdog")
+
     def test_recovery_rejects_garbage_ocr_without_button_flow(self):
         bot = ActivityStubBot(["2", "-- eeeeas", "2", "-- eeeeas"])
         bot._ocr_tesseract_image = lambda _image, psm=7: bot.ocr_region(None, psm=psm)
@@ -995,6 +1039,27 @@ class BackendLogicTests(unittest.TestCase):
                 self.assertEqual(bot.last_recovery_route_snapshot.get("failure_type"), expected_reason)
                 self.assertEqual(bot.last_recovery_route_snapshot.get("support_signals"), ["session_blocked", expected_reason])
                 self.assertTrue(any("session-blocked screen" in message for message in messages))
+
+    def test_unexpected_no_roll_watchdog_skips_off_target_control_text_region(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["UNEXPECTED_NO_ROLL_TIMEOUT"] = 1.0
+        bot.popup_active = lambda *_args, **_kwargs: False
+        bot.banner_active = lambda: False
+        bot.auto_checkbox_state = lambda: "disabled"
+        clicks = []
+        bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
+        bot.stats_changed = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("off-target watchdog path should not click or verify")
+        )
+
+        result = bot.unexpected_not_rolling_watchdog("orCode:279", "ROLLING", None, 9.5, allow_early=True)
+
+        self.assertEqual(result, "off_panel")
+        self.assertEqual(clicks, [])
+        self.assertEqual(bot.last_recovery_route_snapshot.get("route_reason"), "stats_region_off_target_ui_text")
+        self.assertTrue(any("Current roll OCR region appears misconfigured" in message for message in messages))
 
     def test_stats_changed_classifies_disconnect_screen_as_session_blocked(self):
         bot = ActivityStubBot(["clientinitiateddisconnect. errorcode 285"])
@@ -3498,7 +3563,11 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(captures, ["webhook_alert"])
 
     def test_near_miss_discord_alert_uses_clean_spec_layout(self):
-        bot = self.make_bot()
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_rules(DEFAULT_REAL_RULES)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["CURRENT_SPEC_MARKER_OCR"] = False
         bot._format_uptime = lambda: "9m 21s"
         sent = []
         dedup_keys = []
@@ -3534,6 +3603,33 @@ class BackendLogicTests(unittest.TestCase):
         self.assertIn("Gap: -2.1", content)
         self.assertIn("Session:\nUptime: 9m 21s\nTime:", content)
         self.assertNotIn("Near Miss Found", content)
+        self.assertTrue(any("format=v2_clean_markdown" in message for message in messages))
+
+    def test_near_miss_alert_sends_raw_markdown_through_alert_wrapper(self):
+        bot = self.make_bot()
+        sent = []
+
+        def fake_send_discord_message(content, **kwargs):
+            sent.append((content, kwargs))
+            return True
+
+        bot._webhook_should_send = lambda *_args, **_kwargs: True
+        bot.send_discord_message = fake_send_discord_message
+
+        self.assertTrue(
+            bot.send_near_miss_alert(
+                "rampage",
+                "Combo Ramp 29.1 | Damage 29.2 | Crit Rate 3.2 | Crit Damage 6.9",
+                "Crit Damage: 6.9 -> 9-10",
+                "Crit Damage: 2.1 below min",
+            )
+        )
+
+        content, kwargs = sent[0]
+        self.assertTrue(content.startswith("# Kon. Near Miss"))
+        self.assertFalse(content.startswith(APP_VERSION))
+        self.assertNotIn("| Near Miss Found", content)
+        self.assertFalse(kwargs["use_ping"])
 
     def test_near_miss_discord_alert_uses_clean_power_layout(self):
         bot = self.make_bot()

@@ -918,6 +918,33 @@ class AelrithForgeBot:
             return []
         return ["session_blocked", str(reason)]
 
+    def _stats_region_control_text_reason(self, text):
+        cleaned = normalize_text(text or "")
+        if not cleaned:
+            return ""
+        compact = re.sub(r"[^a-z0-9]+", "", cleaned)
+        if not compact:
+            return ""
+        if self._has_activity_stat_signal(cleaned) or self.has_current_spec_marker(cleaned):
+            return ""
+        if self.detect_rollable_trait(cleaned):
+            return ""
+        control_markers = (
+            "ocrpass",
+            "startpowers",
+            "startspecs",
+            "startspec",
+            "startpower",
+            "fartpowers",
+            "rcode",
+            "orcode",
+        )
+        if any(marker in compact for marker in control_markers):
+            return "stats_region_off_target_ui_text"
+        if re.search(r"\b(?:or)?code\s*:?\s*\d+\b", cleaned):
+            return "stats_region_off_target_ui_text"
+        return ""
+
     def _watchdog_roll_panel_support(self, text, trait=None, effective_checkbox_state="unknown"):
         cleaned = normalize_text(text or "")
         signals = []
@@ -2559,6 +2586,7 @@ class AelrithForgeBot:
             return changed, text
 
         unreliable_samples = 0
+        off_target_ui_samples = 0
         image_changed_samples = 0
         max_change_score = 0.0
         weak_samples = 0
@@ -2703,6 +2731,9 @@ class AelrithForgeBot:
                         f"{context} modal text seen in stats OCR after popup-region miss | "
                         f"{self._compact_debug_text(cleaned) or '<empty>'}"
                     )
+            off_target_reason = self._stats_region_control_text_reason(cleaned or new_text)
+            if off_target_reason:
+                off_target_ui_samples += 1
             samples.append({
                 "poll": index + 1,
                 "psm": psm,
@@ -2717,6 +2748,7 @@ class AelrithForgeBot:
                 "poll_elapsed_ms": poll_elapsed_ms,
                 "cache_hits": verify_cache_hits,
                 "cache_misses": verify_cache_misses,
+                "off_target_ui_text": bool(off_target_reason),
             })
             self.log(
                 f"{context} verify sample {index + 1}/{polls} | psm={psm} | "
@@ -2956,6 +2988,48 @@ class AelrithForgeBot:
             self._record_timing_event("recovery_verify", elapsed_ms / 1000.0, context=context, result="confirmed", reason=outcome.reason)
             self.record_decision_chain(subsystem="Recovery", recovery_state="confirmed", recovery_context=context, recovery_reason=self.last_recovery_reason)
             return finish(True, baseline, "confirmed", outcome.reason, polls)
+
+        watchdog_ui_flow = any("watchdog" in str(signal).lower() for signal in ui_signals)
+        if ui_signals and unreliable_samples >= max(1, polls - 1) and watchdog_ui_flow:
+            elapsed_ms = int((time.perf_counter() - verify_started) * 1000)
+            reason = "stats_region_off_target_ui_text" if off_target_ui_samples >= max(1, polls - 1) else "stats_ocr_unreliable_after_watchdog"
+            outcome = self._make_recovery_outcome(
+                confirmed=False,
+                classification="not_rolling",
+                rejection_reason=reason,
+                signal_sources=("ocr",),
+                sample_text=baseline_clean,
+                samples=polls,
+                ui_signals=ui_signals,
+                unreadable=True,
+                weak_samples=weak_samples,
+                exit_reason=reason,
+                context=context,
+            )
+            self._apply_recovery_outcome(outcome)
+            self.last_recovery_verify_unreadable = True
+            self.log(
+                f"{context} rejected unreliable watchdog verification | reason={reason} | "
+                f"unreliable_samples={unreliable_samples}/{polls} | off_target_ui_samples={off_target_ui_samples}/{polls} | "
+                f"elapsed={elapsed_ms}ms"
+            )
+            if reason == "stats_region_off_target_ui_text":
+                self._log_with_cooldown(
+                    "stats_region_off_target_ui_text",
+                    "Current roll OCR region appears misconfigured; reading UI/control text instead of roll stats",
+                    cooldown=30.0,
+                )
+            self._record_timing_event("recovery_verify", elapsed_ms / 1000.0, context=context, result="failed", reason=reason)
+            self.record_decision_chain(
+                subsystem="Recovery",
+                recovery_state="failed",
+                recovery_context=context,
+                recovery_reason=reason,
+                unreliable_samples=unreliable_samples,
+                off_target_ui_samples=off_target_ui_samples,
+                samples=samples[-3:],
+            )
+            return finish(False, baseline, "failed", reason, polls)
 
         if ui_signals and unreliable_samples >= max(1, polls - 1):
             elapsed_ms = int((time.perf_counter() - verify_started) * 1000)
@@ -3430,6 +3504,36 @@ class AelrithForgeBot:
                     return "skipped"
 
             panel_support = self._watchdog_roll_panel_support(baseline, trait=trait, effective_checkbox_state=effective_checkbox_state)
+            off_target_reason = self._stats_region_control_text_reason(baseline)
+            if off_target_reason:
+                self._log_with_cooldown(
+                    "stats_region_off_target_ui_text",
+                    "Current roll OCR region appears misconfigured; reading UI/control text instead of roll stats",
+                    cooldown=30.0,
+                )
+                self._set_recovery_route_snapshot(
+                    result="skipped",
+                    route_reason=off_target_reason,
+                    auto_state=str(effective_checkbox_state or checkbox_state),
+                    rolling_confirmed=False,
+                    failure_type=off_target_reason,
+                    support_signals=["off_target_ui_text"],
+                    context="watchdog",
+                )
+                self._write_ocr_debug_event(
+                    "unexpected_no_roll_watchdog",
+                    {
+                        "phase": "skipped",
+                        "reason": off_target_reason,
+                        "checkbox_state": checkbox_state,
+                        "effective_checkbox_state": effective_checkbox_state,
+                        "state": state,
+                        "trait": trait,
+                        "signature": signature,
+                        "baseline": self._compact_debug_text(baseline, 500),
+                    },
+                )
+                return "off_panel"
             if not panel_support:
                 route_reason = "roll_panel_not_visible_or_unreadable"
                 self.log(
@@ -9144,9 +9248,10 @@ class AelrithForgeBot:
         screenshot_label="webhook_alert",
         dedup=True,
         use_ping=True,
+        raw_content=False,
     ):
         body_text = str(body)
-        raw_markdown = body_text.startswith("# Kon. Near Miss")
+        raw_markdown = bool(raw_content) or body_text.startswith("# Kon. Near Miss")
         content = body_text if body_text.startswith(APP_DISPLAY_NAME) or raw_markdown else self._discord_message(title, footer=body_text)
         dedup_key = event_key if dedup and not critical else None
         if dedup_key and not self._webhook_should_send(dedup_key):
@@ -9199,7 +9304,8 @@ class AelrithForgeBot:
         self.last_important_event = f"Near miss: {display_trait(trait)}"
         body = self._near_miss_discord_body(trait, summary, miss_text, distance)
         key = f"near_miss:{trait}:{distance or miss_text}"
-        return self.send_webhook_alert(key, "Near Miss Found", body, dedup=True, use_ping=False)
+        self.log(f"Near miss Discord alert queued | format=v2_clean_markdown | trait={display_trait(trait)}")
+        return self.send_webhook_alert(key, "Near Miss Found", body, dedup=True, use_ping=False, raw_content=True)
 
     def _send_passive_shard_standalone_update(self, count_text, reason="update"):
         ok = self.send_discord_message(
