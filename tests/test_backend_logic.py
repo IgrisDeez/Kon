@@ -621,16 +621,34 @@ class BackendLogicTests(unittest.TestCase):
         bot.banner_active = lambda: False
         bot.auto_checkbox_state = lambda: "enabled"
         self.force_strong_enabled_checkbox(bot)
-        bot.stats_changed = lambda *_args, **_kwargs: (True, "current spec rampage combo ramp 20 damage 20")
+
+        def fake_stats_changed(_baseline, context="", **_kwargs):
+            if context == "Initial Auto Start preflight rolling check":
+                bot.last_recovery_verify_state = "not_rolling"
+                bot.last_recovery_verify_details = {"reason": "no_material_change", "signal_sources": []}
+                bot.last_recovery_reason = "no_material_change"
+                bot.last_recovery_verify_unreadable = False
+                return False, _baseline
+            bot.last_recovery_verify_state = "rolling"
+            bot.last_recovery_verify_details = {
+                "reason": "stat_numbers_changed",
+                "signal_sources": ["ocr", "image_change"],
+                "image_changed_samples": 1,
+                "max_change_score": 9.0,
+            }
+            bot.last_recovery_reason = "stat_numbers_changed"
+            bot.last_recovery_verify_unreadable = False
+            return True, "current spec rampage combo ramp 20 damage 20"
+
+        bot.stats_changed = fake_stats_changed
         clicks = []
         bot.click = lambda *_args, **_kwargs: clicks.append((_args, _kwargs))
 
         self.assertTrue(bot.start_or_recover("Initial Auto Start"))
         self.assertEqual(bot.last_startup_result, "confirmed_rolling")
-        self.assertEqual([call[0][1] for call in clicks], ["Manual Reroll", "Confirm Reroll"])
-        self.assertTrue(any("Auto checkbox appears already enabled; skipping toggle" in message for message in messages))
-        self.assertTrue(any("popup not confirmed; pressing fallback Yes" in message for message in messages))
-        self.assertTrue(any("Manual reroll flow complete | initial auto start fallback" in message for message in messages))
+        self.assertEqual(clicks, [])
+        self.assertTrue(any("decision=continue_without_toggle" in message for message in messages))
+        self.assertFalse(any("Manual reroll flow | initial auto start fallback" in message for message in messages))
 
     def test_initial_auto_start_clicks_only_when_checkbox_appears_off(self):
         messages = []
@@ -640,18 +658,37 @@ class BackendLogicTests(unittest.TestCase):
         bot.ocr_region = lambda *_args, **_kwargs: "baseline"
         bot.popup_active = lambda *_args, **_kwargs: False
         bot.banner_active = lambda: False
-        states = iter(["disabled"])
+        states = iter(["disabled", "disabled"])
         bot.auto_checkbox_state = lambda: next(states, "enabled")
-        bot.stats_changed = lambda *_args, **_kwargs: (True, "current spec rampage combo ramp 20 damage 20")
+        bot._auto_checkbox_confidence_tier = lambda: "strong_disabled"
+
+        def fake_stats_changed(_baseline, context="", **_kwargs):
+            if context == "Initial Auto Start preflight rolling check":
+                bot.last_recovery_verify_state = "not_rolling"
+                bot.last_recovery_verify_details = {"reason": "no_material_change", "signal_sources": []}
+                bot.last_recovery_reason = "no_material_change"
+                bot.last_recovery_verify_unreadable = False
+                return False, _baseline
+            bot.last_recovery_verify_state = "rolling"
+            bot.last_recovery_verify_details = {
+                "reason": "stat_numbers_changed",
+                "signal_sources": ["ocr", "image_change"],
+                "image_changed_samples": 1,
+                "max_change_score": 9.0,
+            }
+            bot.last_recovery_reason = "stat_numbers_changed"
+            bot.last_recovery_verify_unreadable = False
+            return True, "current spec rampage combo ramp 20 damage 20"
+
+        bot.stats_changed = fake_stats_changed
         clicks = []
         bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
 
         self.assertTrue(bot.start_or_recover("Initial Auto Start"))
         self.assertEqual(bot.last_startup_result, "confirmed_rolling")
-        self.assertEqual([call[0][1] for call in clicks], ["Manual Reroll", "Confirm Reroll"])
-        self.assertTrue(any("validation says Auto is already enabled" in message for message in messages))
-        self.assertTrue(any("popup not confirmed; pressing fallback Yes" in message for message in messages))
-        self.assertTrue(any("Manual reroll flow complete | initial auto start fallback" in message for message in messages))
+        self.assertEqual([call[0][1] for call in clicks], ["Initial Auto Start"])
+        self.assertTrue(any("Auto checkbox appears off; clicking to enable" in message for message in messages))
+        self.assertFalse(any("Manual reroll flow | initial auto start fallback" in message for message in messages))
         self.assertTrue(any("result=confirmed_rolling" in message for message in messages))
 
     def test_recovery_skips_checkbox_toggle_when_auto_already_enabled(self):
@@ -1413,7 +1450,54 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(len(stats_calls), 1)
         self.assertEqual(stats_calls[0][0], "Manual Reroll Auto Resume verify")
         self.assertFalse(stats_calls[0][1]["candidate_signal_enabled"])
+        self.assertFalse(stats_calls[0][1]["post_popup_check_enabled"])
+        self.assertFalse(stats_calls[0][1]["mid_popup_check_enabled"])
         self.assertTrue(any("popup-cleared roll refresh" in message for message in messages))
+
+    def test_manual_reroll_resume_accepts_popup_cleared_roll_like_ocr_below_image_threshold(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot.popup_active = lambda *_args, **_kwargs: True
+        bot.clear_reroll_popup = lambda *_args, **_kwargs: True
+        bot.auto_checkbox_state = lambda: "enabled"
+        self.force_strong_enabled_checkbox(bot)
+        bot.click = lambda *_args, **_kwargs: None
+
+        def fake_stats_changed(baseline, context="", **kwargs):
+            self.assertEqual(context, "Manual Reroll Auto Resume verify")
+            self.assertFalse(kwargs["candidate_signal_enabled"])
+            self.assertFalse(kwargs["post_popup_check_enabled"])
+            self.assertFalse(kwargs["mid_popup_check_enabled"])
+            bot.last_recovery_verify_details = {
+                "classification": "not_rolling",
+                "rejection_reason": "readable_insufficient_change",
+                "image_changed_samples": 0,
+                "max_change_score": 6.57,
+                "unreadable": False,
+                "samples_detail": [
+                    {
+                        "cleaned": "solid hp6.7 .damage3.5",
+                        "unreliable": False,
+                        "materially_different": True,
+                        "trait_only": False,
+                        "image_changed": False,
+                        "change_score": 6.57,
+                    }
+                ],
+            }
+            bot.last_recovery_reason = "readable_insufficient_change"
+            bot.last_recovery_verify_unreadable = False
+            return False, baseline
+
+        bot.stats_changed = fake_stats_changed
+
+        self.assertTrue(bot.manual_reroll_flow("bad power cursebrand"))
+        self.assertTrue(any("reason=recent_popup_clear_roll_like_ocr" in message for message in messages))
+        self.assertTrue(any("support=recent_popup_clear+roll_like_ocr" in message for message in messages))
+        self.assertTrue(any("Manual reroll flow complete" in message for message in messages))
 
     def test_manual_reroll_auto_resume_known_enabled_fails_without_activity_confirmation(self):
         messages = []
@@ -1686,10 +1770,116 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(bot.startup_check_current_roll(), "failed")
         self.assertEqual(len(calls), 2)
         self.assertTrue(calls[0].get("startup_fast"))
+        self.assertTrue(calls[1].get("startup_fast"))
+        self.assertFalse(calls[1].get("allow_fallback"))
         self.assertEqual(manual_calls, ["startup current bad colossus"])
         self.assertTrue(any("Startup Power BAD manual reroll confirmed" in message for message in messages))
+        self.assertTrue(any("route=fast_startup_power_probe" in message for message in messages))
         self.assertTrue(any("strategy=trusted_startup_fast_power_probe" in message for message in messages))
         self.assertTrue(any("skipping slower full current-spec scan" in message for message in messages))
+
+    def test_powers_startup_autoskip_current_power_skips_trust_probe(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_roll_domain("powers")
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot._begin_startup_context("unit test")
+        bot.check_roll = lambda *args, **kwargs: (
+            "NON_TARGET",
+            "non_target_power",
+            "Unsupported or filler power observed; letting Auto continue",
+            "Tempered HP 3.2 Damage 4.2",
+            ["Non-target power"],
+            False,
+        )
+        bot.popup_active = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Powers autoskip should not run popup trust probe")
+        )
+        bot.stats_changed = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Powers autoskip should not run startup trust probe")
+        )
+
+        self.assertEqual(bot.startup_check_current_roll(), "continue")
+        self.assertTrue(bot._startup_context["powers_autoskip_current"])
+        self.assertEqual(bot._startup_context["preflight_fallback_reason"], "autoskip_power")
+        self.assertTrue(any("AUTOSKIP/NON_TARGET" in message for message in messages))
+
+    def test_powers_startup_autoskip_enabled_auto_skips_preflight_and_verify(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_roll_domain("powers")
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot._begin_startup_context("unit test")
+        bot._startup_context["current_spec_class"] = "NON_TARGET filler"
+        bot._startup_context["preflight_fallback_reason"] = "autoskip_power"
+        bot._startup_context["powers_autoskip_current"] = True
+        bot.ocr_region = lambda *_args, **_kwargs: "tempered hp3.2 damage4.2"
+        bot.auto_checkbox_state = lambda: "enabled"
+        self.force_strong_enabled_checkbox(bot)
+        bot.stats_changed = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("enabled Powers autoskip should not run OCR verification")
+        )
+        clicks = []
+        bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
+
+        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(clicks, [])
+        self.assertTrue(any("powers_autoskip_preflight_skipped=True" in message for message in messages))
+        self.assertTrue(any("powers_autoskip=True | action=continue" in message for message in messages))
+
+    def test_powers_startup_autoskip_disabled_auto_observes_without_click(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_roll_domain("powers")
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot._begin_startup_context("unit test")
+        bot._startup_context["current_spec_class"] = "NON_TARGET filler"
+        bot._startup_context["preflight_fallback_reason"] = "autoskip_power"
+        bot._startup_context["powers_autoskip_current"] = True
+        bot.ocr_region = lambda *_args, **_kwargs: "tempered hp3.2 damage4.2"
+        bot.auto_checkbox_state = lambda: "disabled"
+        clicks = []
+        bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
+        bot.stats_changed = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled Powers autoskip should observe without OCR verification")
+        )
+
+        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(clicks, [])
+        self.assertTrue(any("powers_autoskip_preflight_skipped=True" in message for message in messages))
+        self.assertTrue(any("startup_powers_observe_without_toggle" in message for message in messages))
+        self.assertTrue(any("decision=skip_toggle_observe_first" in message for message in messages))
+        self.assertTrue(any("powers_autoskip_current=True" in message for message in messages))
+
+    def test_powers_startup_autoskip_unknown_auto_observes_without_guarded_recovery(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_roll_domain("powers")
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot._begin_startup_context("unit test")
+        bot._startup_context["current_spec_class"] = "NON_TARGET filler"
+        bot._startup_context["preflight_fallback_reason"] = "autoskip_power"
+        bot._startup_context["powers_autoskip_current"] = True
+        bot.ocr_region = lambda *_args, **_kwargs: "tempered hp3.2 damage4.2"
+        bot.auto_checkbox_state = lambda: "unknown"
+        bot.stats_changed = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unknown Powers autoskip should observe without OCR verification")
+        )
+        clicks = []
+        bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
+        bounded_calls = []
+        bot._attempt_auto_reenable_once = lambda *args, **kwargs: bounded_calls.append((args, kwargs)) or False
+
+        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(clicks, [])
+        self.assertEqual(bounded_calls, [])
+        self.assertTrue(any("powers_autoskip_preflight_skipped=True" in message for message in messages))
+        self.assertTrue(any("startup_powers_observe_without_toggle" in message for message in messages))
+        self.assertTrue(any("decision=skip_toggle_observe_first" in message for message in messages))
 
     def test_powers_startup_compact_non_target_preflight_enabled_does_not_click(self):
         messages = []
@@ -1775,6 +1965,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(len(clicks), 1)
         self.assertEqual(clicks[0][0][1], "Initial Auto Start Compact Startup Enable")
         self.assertTrue(any("auto_state=disabled_clicked" in message for message in messages))
+        self.assertFalse(any("startup_powers_observe_without_toggle" in message for message in messages))
 
     def test_powers_startup_compact_enabled_no_click_skips_double_check_after_decisive_nonconfirming_primary(self):
         messages = []
@@ -2023,6 +2214,88 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(manual_calls, [])
         self.assertTrue(any("auto_state=disabled" in message and "decision=enable_auto_once" in message for message in messages))
 
+    def test_specs_startup_weak_marker_change_does_not_manual_reroll_without_bad_or_popup(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_roll_domain("specs")
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot._begin_startup_context("unit test")
+        bot._startup_context["current_spec_class"] = "NON_TARGET filler"
+        bot._startup_context["preflight_fallback_reason"] = "weak_non_improving_dead_phase"
+        bot.ocr_region = lambda *_args, **_kwargs: "came"
+        bot.popup_active = lambda *_args, **_kwargs: False
+        bot.auto_checkbox_state = lambda: "disabled"
+        clicks = []
+        bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
+        manual_calls = []
+        bot.manual_reroll_flow = lambda reason="": manual_calls.append(reason) or True
+        stats_calls = []
+
+        def fake_stats_changed(_baseline, context="", **kwargs):
+            stats_calls.append(context)
+            bot.last_recovery_verify_state = "rolling"
+            bot.last_recovery_verify_details = {
+                "reason": "current_spec_marker_changed",
+                "signal_sources": ["current_spec_refresh"],
+                "image_changed_samples": 0,
+                "max_change_score": 0.0,
+                "classification": "rolling",
+            }
+            bot.last_recovery_reason = "current_spec_marker_changed"
+            bot.last_recovery_verify_unreadable = False
+            return True, "current-spec. critchanceiii critchance1.1"
+
+        bot.stats_changed = fake_stats_changed
+
+        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(manual_calls, [])
+        self.assertEqual(clicks, [])
+        self.assertEqual(stats_calls, ["Initial Auto Start preflight rolling check"])
+        self.assertTrue(any("startup_specs_observe_without_toggle" in message for message in messages))
+        self.assertTrue(any("decision=skip_toggle_observe_first" in message for message in messages))
+        self.assertFalse(any("Auto-roll still not confirmed after double check. Using manual reroll fallback." in message for message in messages))
+
+    def test_specs_startup_unknown_checkbox_with_roll_like_ocr_observes_without_click(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_roll_domain("specs")
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot._begin_startup_context("unit test")
+        bot._startup_context["current_spec_class"] = "NON_TARGET filler"
+        bot._startup_context["preflight_fallback_reason"] = "weak_non_improving_dead_phase"
+        bot.ocr_region = lambda *_args, **_kwargs: "came"
+        bot.popup_active = lambda *_args, **_kwargs: False
+        bot.auto_checkbox_state = lambda: "unknown"
+        clicks = []
+        bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
+        manual_calls = []
+        bot.manual_reroll_flow = lambda reason="": manual_calls.append(reason) or True
+
+        def fake_stats_changed(_baseline, context="", **kwargs):
+            bot.last_recovery_verify_state = "rolling"
+            bot.last_recovery_verify_details = {
+                "reason": "current_spec_marker_changed",
+                "signal_sources": ["current_spec_refresh"],
+                "image_changed_samples": 0,
+                "max_change_score": 0.0,
+                "classification": "rolling",
+            }
+            bot.last_recovery_reason = "current_spec_marker_changed"
+            bot.last_recovery_verify_unreadable = False
+            return True, "current-spec. damageii damage24.9"
+
+        bot.stats_changed = fake_stats_changed
+
+        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(clicks, [])
+        self.assertEqual(manual_calls, [])
+        self.assertTrue(any("startup_specs_observe_without_toggle" in message for message in messages))
+        self.assertTrue(any("auto_state=unknown" in message and "decision=skip_toggle_observe_first" in message for message in messages))
+
     def test_powers_safe_filler_unresolved_startup_still_blocks_manual_reroll(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
@@ -2096,6 +2369,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertIn("Compact Startup Recovery", bounded_calls[0][0][0])
         self.assertTrue(bounded_calls[0][1]["force_click_on_ambiguous"])
         self.assertTrue(any("auto_state=unknown_guarded_path" in message for message in messages))
+        self.assertFalse(any("startup_powers_observe_without_toggle" in message for message in messages))
 
     def test_powers_startup_compact_disabled_click_does_not_repeat_same_click_when_final_state_stays_disabled(self):
         messages = []
@@ -2214,6 +2488,111 @@ class BackendLogicTests(unittest.TestCase):
         self.assertIn("Unsupported or filler power observed", summary)
         self.assertEqual(missing, ["Non-target power"])
         self.assertFalse(near)
+
+    def test_disabled_supported_power_autoskips_without_manual_reroll(self):
+        bot = StubBot(
+            [
+                (
+                    "tesseract-test",
+                    "Colossus > +23.4% Boss DMG, Damage 22.2%, Crit Chance 1.8%, Luck 14.6%, HP 27.8%, Crit Damage 7.6%",
+                    "Colossus > +23.4% Boss DMG, Damage 22.2%, Crit Chance 1.8%, Luck 14.6%, HP 27.8%, Crit Damage 7.6%",
+                )
+            ]
+        )
+        bot.set_roll_domain("powers")
+        bot.set_enabled_powers({"cursebrand", "subjugator"})
+        bot.manual_reroll_flow = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled supported powers should autoskip, not manual reroll")
+        )
+
+        state, trait, summary, _text, missing, near = bot.check_roll()
+
+        self.assertEqual(state, "NON_TARGET")
+        self.assertEqual(trait, "non_target_power")
+        self.assertIn("not enabled", summary)
+        self.assertEqual(missing, ["Autoskip power"])
+        self.assertFalse(near)
+        self.assertTrue(any("AUTOSKIP Power | trait=Colossus" in message for message in bot.messages))
+
+    def test_power_loop_bad_uses_fast_confirmation_for_coherent_stable_read(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_roll_domain("powers")
+        self.apply_subjugator_luck_target(bot)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["STARTUP_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot.startup_check_current_roll = lambda: "rerolled"
+        bot._finish_startup_summary = lambda *_args, **_kwargs: None
+        bot.finish_live_status = lambda *_args, **_kwargs: None
+        bot.start_live_status = lambda: None
+        bot.maybe_report_passive_shards = lambda force=False: 10
+        bot.maybe_report_power_shards = lambda force=False: 10
+        bot.should_check_passive_shards_empty = lambda _count: False
+        bot.should_check_power_shards_empty = lambda _count: False
+        bot.passive_shards_empty_confirmed = lambda _count: False
+        bot.power_shards_empty_confirmed = lambda _count: False
+        bad_text = "Subjugator NPC Slow 20% 5s Damage 36.8 Crit Chance 2.8 Luck 9.4 HP 34.4 Crit Damage 10.2"
+        check_calls = []
+
+        def fake_check_roll(*args, **kwargs):
+            check_calls.append(kwargs)
+            return self.evaluate_power_text(bot, bad_text, "loop")
+
+        bot.check_roll = fake_check_roll
+
+        def manual_reroll(reason=""):
+            bot.stop_event.set()
+            return True
+
+        bot.manual_reroll_flow = manual_reroll
+
+        bot.loop()
+
+        self.assertGreaterEqual(len(check_calls), 2)
+        self.assertEqual(check_calls[1], {"allow_fallback": False, "startup_fast": True})
+        self.assertTrue(any("Loop Power BAD manual reroll confirmed | route=fast_power_probe" in message for message in messages))
+
+    def test_weak_power_bad_chain_does_not_use_fast_confirmation(self):
+        bot = AelrithForgeBot(lambda *_: None, lambda *_: None)
+        bot.set_roll_domain("powers")
+        bot.last_decision_chain = {
+            "classification": "BAD",
+            "current_trait": "Subjugator",
+            "power_parse_coherent": False,
+            "power_candidate_quality": 150,
+            "power_required_values": {"Luck": None},
+        }
+
+        self.assertFalse(bot._power_bad_fast_confirm_allowed("subjugator"))
+
+    def test_power_check_skips_fallback_for_coherent_bad_fast_read(self):
+        class FastPowerBot(AelrithForgeBot):
+            def __init__(self, text):
+                self.messages = []
+                super().__init__(self.messages.append, lambda *_: None)
+                self.cfg["OCR_DEBUG_FILE"] = False
+                self.text = text
+                self.calls = []
+
+            def get_stats_ocr_candidates(self, *args, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs.get("fallback_only"):
+                    raise AssertionError("coherent BAD power should not need fallback OCR")
+                if kwargs.get("fast_loop"):
+                    return [("fast-loop", self.text, self.text)]
+                return [("primary", self.text, self.text)]
+
+        bad_text = "Subjugator NPC Slow 20% 5s Damage 36.8 Crit Chance 2.8 Luck 9.4 HP 34.4 Crit Damage 10.2"
+        bot = FastPowerBot(bad_text)
+        self.apply_subjugator_luck_target(bot)
+
+        state, trait, _summary, _text, missing, _near = bot.check_roll()
+
+        self.assertEqual(state, "BAD")
+        self.assertEqual(trait, "subjugator")
+        self.assertTrue(any("Luck" in item for item in missing))
+        self.assertEqual(bot.calls, [{"startup_fast": False, "fast_loop": True}])
 
     def test_powers_startup_verify_sample_bad_power_manual_rerolls(self):
         messages = []
@@ -2782,6 +3161,68 @@ class BackendLogicTests(unittest.TestCase):
             1,
         )
 
+    def test_passive_shard_offtarget_roll_text_backs_off_in_powers_mode(self):
+        class CountingPassiveShardBot(PassiveShardStubBot):
+            def __init__(self, attempts):
+                super().__init__(attempts)
+                self.calls = 0
+
+            def passive_shard_ocr_attempts(self, image=None, region=None):
+                self.calls += 1
+                return super().passive_shard_ocr_attempts(image=image, region=region)
+
+        bot = CountingPassiveShardBot(
+            [
+                {
+                    "mode": "raw",
+                    "psm": 7,
+                    "raw": "Mythi",
+                    "normalized": "",
+                    "parsed": None,
+                    "formatted": "not found",
+                    "reason": "no normalized digits",
+                },
+                {
+                    "mode": "gray",
+                    "psm": 6,
+                    "raw": "Non-targetPow",
+                    "normalized": "",
+                    "parsed": None,
+                    "formatted": "not found",
+                    "reason": "no normalized digits",
+                },
+            ]
+        )
+        bot.set_roll_domain("powers")
+        bot.last_passive_shards = 201000
+
+        self.assertIsNone(bot.read_passive_shards())
+        self.assertEqual(bot.read_passive_shards(), 201000)
+        self.assertEqual(bot.calls, 1)
+        self.assertGreater(bot._passive_shard_backoff_until, time.time())
+        self.assertTrue(any("backing off repeated reads" in message for message in bot.messages))
+
+    def test_power_shard_reporting_still_runs_while_passive_backoff_is_active(self):
+        bot = PowerShardStubBot(
+            [
+                {
+                    "mode": "raw",
+                    "psm": 7,
+                    "raw": "473K Power Shards",
+                    "normalized": "473k",
+                    "parsed": 473000,
+                    "formatted": "473,000",
+                    "reason": "parsed",
+                    "candidate_type": "explicit_suffix",
+                }
+            ]
+        )
+        bot.set_roll_domain("powers")
+        bot._passive_shard_backoff_until = time.time() + 60
+
+        self.assertEqual(bot.maybe_report_power_shards(force=True), 473000)
+        self.assertEqual(bot.last_power_shards, 473000)
+
     def test_passive_shard_state_keeps_previous_value_after_garbage_ocr(self):
         bot = PassiveShardStubBot(
             [
@@ -3055,6 +3496,78 @@ class BackendLogicTests(unittest.TestCase):
         self.assertTrue(bot.send_webhook_alert("popup_stuck", "Popup", "body", attach_screenshot=True))
         self.assertFalse(bot.send_webhook_alert("popup_stuck", "Popup", "body", attach_screenshot=True))
         self.assertEqual(captures, ["webhook_alert"])
+
+    def test_near_miss_discord_alert_uses_clean_spec_layout(self):
+        bot = self.make_bot()
+        bot._format_uptime = lambda: "9m 21s"
+        sent = []
+        dedup_keys = []
+        bot._webhook_should_send = lambda key, window=None: dedup_keys.append(key) or True
+        bot.send_discord_message = lambda content, **kwargs: sent.append((content, kwargs)) or True
+
+        ok = bot.send_near_miss_alert(
+            "rampage",
+            "Combo Ramp 29.1 | Damage 29.2 | Crit Rate 3.2 | Crit Damage 6.9",
+            "Crit Damage: 6.9 -> 9-10",
+            "Crit Damage: 2.1 below min",
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(bot.session_near_misses, 1)
+        self.assertEqual(bot.last_important_event, "Near miss: Rampage")
+        self.assertEqual(dedup_keys, ["near_miss:rampage:Crit Damage: 2.1 below min"])
+        content, kwargs = sent[0]
+        self.assertFalse(kwargs["use_ping"])
+        self.assertTrue(content.startswith("# Kon. Near Miss"))
+        self.assertIn("━━━━━━━━━━━━━━━━━━━━━━━", content)
+        self.assertIn("Rampage was close, but skipped.", content)
+        self.assertIn("```", content)
+        self.assertTrue(content.rstrip().endswith("```"))
+        self.assertIn("Stat Result", content)
+        self.assertIn("Combo Ramp      29.1", content)
+        self.assertIn("Damage          29.2", content)
+        self.assertIn("Crit Rate        3.2", content)
+        self.assertIn("Crit Damage      6.9", content)
+        self.assertIn("Missed:\nCrit Damage", content)
+        self.assertIn("Rolled: 6.9", content)
+        self.assertIn("Needed: 9–10", content)
+        self.assertIn("Gap: -2.1", content)
+        self.assertIn("Session:\nUptime: 9m 21s\nTime:", content)
+        self.assertNotIn("Near Miss Found", content)
+
+    def test_near_miss_discord_alert_uses_clean_power_layout(self):
+        bot = self.make_bot()
+        bot.set_roll_domain("powers")
+        bot._format_uptime = lambda: "2m 3s"
+        sent = []
+        dedup_keys = []
+        bot._webhook_should_send = lambda key, window=None: dedup_keys.append(key) or True
+        bot.send_discord_message = lambda content, **kwargs: sent.append((content, kwargs)) or True
+
+        ok = bot.send_near_miss_alert(
+            "subjugator",
+            "Passive NPC Slow 20 5s | Damage 36.8 | Crit Chance 2.8 | Luck 9.4 | HP (optional) 34.4 | Crit Damage 10.2",
+            "Luck: 9.4 -> 17-17.5",
+            "Luck: 7.6 below min",
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(bot.session_near_misses, 1)
+        self.assertEqual(bot.last_important_event, "Near miss: Subjugator")
+        self.assertEqual(dedup_keys, ["near_miss:subjugator:Luck: 7.6 below min"])
+        content, kwargs = sent[0]
+        self.assertFalse(kwargs["use_ping"])
+        self.assertTrue(content.startswith("# Kon. Near Miss"))
+        self.assertIn("Subjugator was close, but skipped.", content)
+        self.assertIn("Passive NPC Slow 20 5s", content)
+        self.assertIn("Damage            36.8", content)
+        self.assertIn("HP                34.4", content)
+        self.assertIn("Missed:\nLuck", content)
+        self.assertIn("Rolled: 9.4", content)
+        self.assertIn("Needed: 17–17.5", content)
+        self.assertIn("Gap: -7.6", content)
+        self.assertIn("Session:\nUptime: 2m 3s\nTime:", content)
+        self.assertTrue(content.rstrip().endswith("```"))
 
     def test_check_roll_marks_rampage_god_roll_with_combo_ramp(self):
         bot = StubBot(
@@ -3778,6 +4291,7 @@ class BackendLogicTests(unittest.TestCase):
     def test_startup_manual_fallback_skips_duplicate_verify_after_recent_manual_confirmation(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.set_roll_domain("powers")
         bot.cfg["OCR_DEBUG_FILE"] = False
         bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
         bot.cfg["AUTO_VERIFY_POLLS"] = 1

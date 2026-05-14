@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.100.18
+
+- Reformatted Discord near-miss alerts into a cleaner Markdown summary for Specs and Powers rolls.
+- Added aligned stat-result, missed-stat, gap, uptime, and timestamp sections while preserving near-miss detection and dedup behavior.
+- Added backend regressions for Rampage and Power near-miss alert bodies.
+
+## v1.100.17
+
+- Added a Powers startup observe-first guard so autoskip/non-target Power rolls do not risk toggling Auto from disabled/unknown checkbox reads.
+- Logged `startup_powers_observe_without_toggle` decisions with checkbox confidence, OCR reason, change score, and autoskip support signals.
+- Updated Powers startup regressions for disabled/unknown autoskip reads while preserving bounded Auto enable when no roll evidence exists.
+
+## v1.100.16
+
+- Skipped Specs startup Auto toggles when non-target/filler OCR already shows current-spec refresh activity.
+- Added `startup_specs_observe_without_toggle` logging with checkbox confidence, OCR reason, startup class, and change score.
+- Added regressions for disabled/unknown checkbox reads with roll-like OCR and for the no-refresh bounded enable path.
+
+## v1.100.15
+
+- Blocked generic Specs startup manual reroll fallback unless a BAD/DISABLED mythical or popup was confirmed.
+- Logged blocked non-BAD Specs startup fallbacks with state, trait, startup class, Auto state, and popup confirmation status.
+- Updated startup regressions so filler/non-target Specs startup fails safe instead of clicking manual reroll.
+
+## v1.100.14
+
+- Added a fast Powers loop OCR route that tries one psm6 candidate before escalating to broader primary/fallback OCR.
+- Reused coherent stable BAD Power parses for fast loop confirmation and added sampled loop timing telemetry.
+- Backed off passive shard OCR in Powers mode when the configured region is reading roll text, while keeping Power shard checks active.
+- Added regressions for fast BAD confirmation, popup-cleared resume verification flags, and passive shard backoff.
+
+## v1.100.13
+
+- Treated unsupported, filler, and disabled Powers as autoskip/non-target rolls so only enabled listed Mythicals can trigger BAD manual reroll.
+- Skipped slow startup trust/preflight OCR for Powers autoskip rolls and used compact Auto handling instead.
+- Added regressions for disabled Power autoskip, enabled/disabled/unknown Auto autoskip startup, and BAD Mythical preservation.
+
+## v1.100.12
+
+- Confirmed manual reroll resume after a cleared popup when readable roll-like OCR appears below the general image-change threshold.
+- Used the fast no-fallback OCR path to confirm strong startup BAD Power detections instead of repeating slow fallback candidate scans.
+- Added regressions for below-threshold popup-cleared resume OCR and fast startup BAD Power confirmation.
+
 ## v1.100.11
 
 - Restored unsupported/non-target Power handling so non-mythic or unsupported rolls remain Auto-roll filler instead of manual reroll targets.

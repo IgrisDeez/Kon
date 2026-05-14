@@ -745,6 +745,8 @@ class AelrithForgeBot:
         self.last_passive_shard_bucket = "normal"
         self.last_passive_shard_bucket_alert = {}
         self._passive_shard_region_warned = False
+        self._passive_shard_backoff_until = 0.0
+        self._passive_shard_backoff_reason = ""
         self.last_power_shard_report = 0.0
         self.last_power_shards = None
         self.last_power_shards_sent = None
@@ -811,6 +813,7 @@ class AelrithForgeBot:
         self.recent_route_budget_events = []
         self.last_verification_cache_stats = {}
         self._runtime_log_dedup = {}
+        self._last_loop_perf_log = 0.0
 
     def update(self, **kwargs):
         self.cfg.update(kwargs)
@@ -1344,7 +1347,7 @@ class AelrithForgeBot:
             )
         return variants
 
-    def _tesseract_stat_passes(self, img, fallback_only=False, full=False, startup_fast=False):
+    def _tesseract_stat_passes(self, img, fallback_only=False, full=False, startup_fast=False, fast_loop=False):
         primary_modes = {
             "full-original",
             "full-gray",
@@ -1358,9 +1361,14 @@ class AelrithForgeBot:
             "text-threshold",
             "full-original",
         }
+        fast_loop_modes = {"full-original"}
         for mode_name, variant in self._tesseract_stat_variants(img):
             if full:
                 psms = (6, 7)
+            elif fast_loop:
+                if mode_name not in fast_loop_modes:
+                    continue
+                psms = (6,)
             elif startup_fast:
                 if mode_name not in startup_fast_modes:
                     continue
@@ -1383,7 +1391,7 @@ class AelrithForgeBot:
     def ocr_region(self, region, psm=7):
         return self.ocr_region_tesseract(region, psm)
 
-    def get_stats_ocr_candidates(self, image=None, region=None, fallback_only=False, full=False, startup_fast=False):
+    def get_stats_ocr_candidates(self, image=None, region=None, fallback_only=False, full=False, startup_fast=False, fast_loop=False):
         region = tuple(region or self.cfg["STATS_REGION"])
         candidates = []
         started = time.perf_counter()
@@ -1393,7 +1401,13 @@ class AelrithForgeBot:
         img = image if image is not None else pyautogui.screenshot(region=region)
         signature = self._region_signature(img)
 
-        for mode_name, variant, psm in self._tesseract_stat_passes(img, fallback_only=fallback_only, full=full, startup_fast=startup_fast):
+        for mode_name, variant, psm in self._tesseract_stat_passes(
+            img,
+            fallback_only=fallback_only,
+            full=full,
+            startup_fast=startup_fast,
+            fast_loop=fast_loop,
+        ):
             engine = f"tesseract-{mode_name}-psm{psm}"
             key = ("tesseract_stat", tuple(region), mode_name, int(psm))
             raw = self._cached_ocr(key, signature)
@@ -1422,6 +1436,7 @@ class AelrithForgeBot:
                 "fallback_only": bool(fallback_only),
                 "full": bool(full),
                 "startup_fast": bool(startup_fast),
+                "fast_loop": bool(fast_loop),
                 "candidates": [
                     {
                         "engine": engine,
@@ -2485,6 +2500,7 @@ class AelrithForgeBot:
         fast_popup_checks=False,
         initial_banner_known_false=False,
         fast_post_popup_check=False,
+        mid_popup_check_enabled=True,
         single_useful_sample_ok=False,
     ):
         verify_started = time.perf_counter()
@@ -2647,11 +2663,13 @@ class AelrithForgeBot:
             signature = None
             change_score = 0.0
             image_changed = False
+            signature_changed = False
             try:
                 img = poll_image()
                 signature = self._region_signature(img)
                 if baseline_img is not None and baseline_signature is not None:
                     change_score = self._region_change_score(baseline_img, img)
+                    signature_changed = bool(signature != baseline_signature)
                     image_changed = bool(signature != baseline_signature and change_score >= self._stats_verify_changed_threshold())
             except Exception:
                 img = None
@@ -2694,6 +2712,7 @@ class AelrithForgeBot:
                 "materially_different": materially_different,
                 "trait_only": trait_only,
                 "image_changed": image_changed,
+                "signature_changed": signature_changed,
                 "change_score": round(change_score, 2),
                 "poll_elapsed_ms": poll_elapsed_ms,
                 "cache_hits": verify_cache_hits,
@@ -2806,7 +2825,7 @@ class AelrithForgeBot:
                 )
                 return finish(True, cleaned or new_text, "confirmed", reason, index + 1)
 
-            if index == polls // 2:
+            if mid_popup_check_enabled and index == polls // 2:
                 popup_now = self._popup_active_checked(
                     log=True,
                     context=f"{context} mid-check",
@@ -3822,6 +3841,7 @@ class AelrithForgeBot:
                 "abandon_on_weak_samples": transition_profile.get("compact_verify_abandon_on_weak_samples", 1),
                 "initial_popup_known_false": popup_known_false,
                 "post_popup_check_enabled": not popup_known_false,
+                "mid_popup_check_enabled": not popup_known_false,
                 "fast_popup_checks": True,
                 "fast_post_popup_check": True,
                 "single_useful_sample_ok": True,
@@ -3837,6 +3857,7 @@ class AelrithForgeBot:
                 "candidate_signal_enabled": False,
                 "initial_popup_known_false": popup_known_false,
                 "post_popup_check_enabled": not popup_known_false,
+                "mid_popup_check_enabled": not popup_known_false,
                 "fast_popup_checks": True,
                 "fast_post_popup_check": True,
                 "single_useful_sample_ok": True,
@@ -3917,14 +3938,16 @@ class AelrithForgeBot:
             "max_change_score": round(max_change_score, 2),
         }
 
-    def _manual_reroll_roll_like_refresh_sample(self, samples):
+    def _manual_reroll_roll_like_refresh_sample(self, samples, require_image_changed=False):
         for sample in samples or []:
             cleaned = str(sample.get("cleaned") or "").strip()
             if not cleaned or sample.get("unreliable") or sample.get("trait_only"):
                 continue
-            if not sample.get("image_changed"):
+            if require_image_changed and not sample.get("image_changed"):
                 continue
             if not sample.get("materially_different") and not sample.get("reason"):
+                continue
+            if self._session_blocked_ocr_reason(cleaned):
                 continue
             numbers = extract_numbers(cleaned)
             stat_signal = self._has_activity_stat_signal(cleaned)
@@ -3965,17 +3988,27 @@ class AelrithForgeBot:
                 and not outcome.unreadable
                 and outcome.classification == "not_rolling"
                 and resolved_reason == "readable_insufficient_change"
-                and int(outcome.image_changed_samples or 0) > 0
             ):
                 sample_text = self._manual_reroll_roll_like_refresh_sample(
                     (verify_details or {}).get("samples_detail") or []
                 )
                 if sample_text:
+                    signals = ["recent_popup_clear", "roll_like_ocr"]
+                    if int(outcome.image_changed_samples or 0) > 0:
+                        signals.insert(1, "image_change")
+                    elif any(sample.get("signature_changed") for sample in (verify_details or {}).get("samples_detail") or []):
+                        signals.insert(1, "screen_signature_change")
                     return {
                         **support,
                         "strong": True,
-                        "reason": "recent_popup_clear_roll_like_ocr_after_image_change",
-                        "signals": ["recent_popup_clear", "image_change", "roll_like_ocr"],
+                        "reason": (
+                            "recent_popup_clear_roll_like_ocr_after_image_change"
+                            if int(outcome.image_changed_samples or 0) > 0
+                            else "recent_popup_clear_roll_like_ocr_after_signature_change"
+                            if "screen_signature_change" in signals
+                            else "recent_popup_clear_roll_like_ocr"
+                        ),
+                        "signals": signals,
                         "sample_text": sample_text,
                     }
             return support
@@ -4323,7 +4356,37 @@ class AelrithForgeBot:
     def _power_required_values_match(self, first, second):
         return dict(first or {}) == dict(second or {})
 
-    def _confirm_power_bad_before_manual_reroll(self, trait, missing, context="Power BAD manual reroll"):
+    def _power_bad_confirmation_stable(self, confirm_state, confirm_trait, confirm_missing, confirm_chain, initial_required, trait, missing):
+        confirm_required = dict((confirm_chain or {}).get("power_required_values") or {})
+        stable = (
+            confirm_state == "BAD"
+            and confirm_trait == trait
+            and bool((confirm_chain or {}).get("power_parse_coherent"))
+            and self._power_required_values_match(initial_required, confirm_required)
+            and list(confirm_missing or []) == list(missing or [])
+        )
+        return stable, confirm_required
+
+    def _power_bad_fast_confirm_allowed(self, trait=None):
+        if self.roll_domain != "powers":
+            return False
+        chain = dict(self.last_decision_chain or {})
+        if chain.get("classification") != "BAD":
+            return False
+        if trait and power_display_name(trait) != str(chain.get("current_trait") or ""):
+            return False
+        if not chain.get("power_parse_coherent"):
+            return False
+        required = chain.get("power_required_values") or {}
+        if not required or any(value is None for value in required.values()):
+            return False
+        try:
+            quality = float(chain.get("power_candidate_quality") or 0)
+        except Exception:
+            quality = 0.0
+        return quality >= 110.0
+
+    def _confirm_power_bad_before_manual_reroll(self, trait, missing, context="Power BAD manual reroll", fast_first=False):
         if self.roll_domain != "powers":
             return True
         initial_chain = dict(self.last_decision_chain or {})
@@ -4339,15 +4402,50 @@ class AelrithForgeBot:
         delay = min(0.08, max(0.0, float(self.cfg.get("PARTIAL_TARGET_CONFIRM_DELAY", 0.08))))
         if delay and not self._interruptible_sleep(delay, "power BAD confirmation delay"):
             return False
+        if fast_first:
+            fast_route = "fast_startup_power_probe" if "startup" in str(context).lower() else "fast_power_probe"
+            confirm_state, confirm_trait, _summary, _ocr_text, confirm_missing, _near = self.check_roll(
+                allow_fallback=False,
+                startup_fast=True,
+            )
+            confirm_chain = dict(self.last_decision_chain or {})
+            stable, confirm_required = self._power_bad_confirmation_stable(
+                confirm_state,
+                confirm_trait,
+                confirm_missing,
+                confirm_chain,
+                initial_required,
+                trait,
+                missing,
+            )
+            if stable:
+                self.log(
+                    f"{context} confirmed | route={fast_route} | trait={power_display_name(trait)} | "
+                    f"missing={' ; '.join(missing or []) or 'none'} | "
+                    f"quality={confirm_chain.get('power_candidate_quality', 'unknown')} | "
+                    f"required={confirm_required}"
+                )
+                return True
+            self.log(
+                f"{context} rejected | route={fast_route} | "
+                f"initial_trait={power_display_name(trait)} | "
+                f"confirm_state={confirm_state} confirm_trait={power_display_name(confirm_trait) if confirm_trait else 'unknown'} | "
+                f"initial_required={initial_required} confirm_required={confirm_required} | "
+                f"initial_missing={' ; '.join(missing or []) or 'none'} | "
+                f"confirm_missing={' ; '.join(confirm_missing or []) or 'none'}"
+            )
+            return False
+        self.log(f"{context} using full fallback confirmation | reason=fast_confirmation_not_requested")
         confirm_state, confirm_trait, _summary, _ocr_text, confirm_missing, _near = self.check_roll(allow_fallback=True)
         confirm_chain = dict(self.last_decision_chain or {})
-        confirm_required = confirm_chain.get("power_required_values") or {}
-        stable = (
-            confirm_state == "BAD"
-            and confirm_trait == trait
-            and bool(confirm_chain.get("power_parse_coherent"))
-            and self._power_required_values_match(initial_required, confirm_required)
-            and list(confirm_missing or []) == list(missing or [])
+        stable, confirm_required = self._power_bad_confirmation_stable(
+            confirm_state,
+            confirm_trait,
+            confirm_missing,
+            confirm_chain,
+            initial_required,
+            trait,
+            missing,
         )
         if stable:
             self.log(
@@ -4494,19 +4592,40 @@ class AelrithForgeBot:
             "image_changed_samples": 0,
             "max_change_score": 0.0,
         }
+        startup_preflight_support = {
+            "strong": False,
+            "signals": [],
+            "reason": "none",
+            "image_changed_samples": 0,
+            "max_change_score": 0.0,
+        }
+        powers_autoskip_startup = False
         if startup_recovery:
             startup_ctx = getattr(self, "_startup_context", {}) if self._startup_context_active() else {}
             startup_spec_class = startup_ctx.get("current_spec_class", "unknown")
             safe_filler_state = startup_spec_class == "NON_TARGET filler"
             bridge_fallback_reason = startup_ctx.get("preflight_fallback_reason", "none")
-            compact_non_target_preflight = (
-                self.roll_domain == "powers" and safe_filler_state and bridge_fallback_reason in {
-                    "weak_non_improving_bridge_probe",
-                    "weak_non_improving_dead_phase",
-                    "none",
-                    "stat_numbers_changed",
-                }
+            powers_autoskip_startup = bool(
+                self.roll_domain == "powers"
+                and safe_filler_state
+                and startup_ctx.get("powers_autoskip_current")
             )
+            compact_non_target_preflight = (
+                powers_autoskip_startup
+                or (
+                    self.roll_domain == "powers" and safe_filler_state and bridge_fallback_reason in {
+                        "weak_non_improving_bridge_probe",
+                        "weak_non_improving_dead_phase",
+                        "none",
+                        "stat_numbers_changed",
+                    }
+                )
+            )
+            if powers_autoskip_startup:
+                quick_verify_kwargs = self._stats_verify_profile(
+                    "startup_safe_filler_preflight",
+                    popup_known_false=True,
+                )
             reused_popup_clear = compact_non_target_preflight
             startup_popup_state = False if reused_popup_clear else self._popup_active_checked(
                 log=True,
@@ -4533,12 +4652,21 @@ class AelrithForgeBot:
                     "fast_post_popup_check": True,
                 }
             preflight_started = time.perf_counter()
-            preflight_changed, preflight_text = self.stats_changed(
-                baseline,
-                f"{label} preflight rolling check",
-                **preflight_kwargs,
-            )
-            startup_preflight_rolling_state = self.last_recovery_verify_state if not preflight_changed else "rolling"
+            if powers_autoskip_startup:
+                preflight_changed = False
+                preflight_text = baseline
+                startup_preflight_rolling_state = "not_rolling"
+                self.log(
+                    f"[Startup Timing] powers_autoskip_preflight_skipped=True | "
+                    f"reason=autoskip_power_not_listed | {label}"
+                )
+            else:
+                preflight_changed, preflight_text = self.stats_changed(
+                    baseline,
+                    f"{label} preflight rolling check",
+                    **preflight_kwargs,
+                )
+                startup_preflight_rolling_state = self.last_recovery_verify_state if not preflight_changed else "rolling"
             self.log(
                 f"[Startup Observe] auto_state=pending | rolling_state={startup_preflight_rolling_state} | "
                 f"popup_state={startup_popup_state} | phase=preflight | elapsed={int((time.perf_counter() - preflight_started) * 1000)}ms | fast_non_target_preflight={fast_non_target_preflight} | compact_non_target_preflight={compact_non_target_preflight} | reused_popup_clear={reused_popup_clear} | bridge_fallback_reason={bridge_fallback_reason}"
@@ -4551,6 +4679,7 @@ class AelrithForgeBot:
                     self.last_recovery_reason,
                     popup_state=startup_popup_state,
                 )
+                startup_preflight_support = dict(preflight_support)
                 if preflight_support["strong"]:
                     self.log(
                         f"[Startup Decide] auto_state=skipped | rolling_state=rolling | popup_state={startup_popup_state} | "
@@ -4570,10 +4699,66 @@ class AelrithForgeBot:
                     f"decision=reobserve_via_checkbox_path | reason=preflight rolling signal was marginal and cannot suppress guarded startup seed path | "
                     f"support={'+'.join(preflight_support['signals']) or 'none'} | confidence=marginal | {label}"
                 )
+            def _startup_observe_without_toggle_reason(observed_state: str) -> str:
+                if (
+                    not safe_filler_state
+                    or startup_popup_state
+                    or observed_state not in ("disabled", "unknown")
+                ):
+                    return ""
+                if self.roll_domain == "specs" and bool(startup_preflight_support.get("signals")):
+                    return "startup_specs_observe_without_toggle"
+                if self.roll_domain == "powers" and (
+                    powers_autoskip_startup or bool(startup_preflight_support.get("signals"))
+                ):
+                    return "startup_powers_observe_without_toggle"
+                return ""
+
+            def _finish_startup_observe_without_toggle(reason: str, observed_state: str) -> bool:
+                checkbox_confidence = self._auto_checkbox_confidence_tier()
+                supports = list(startup_preflight_support.get("signals") or [])
+                if reason == "startup_powers_observe_without_toggle" and powers_autoskip_startup:
+                    if "autoskip_power_not_listed" not in supports:
+                        supports.append("autoskip_power_not_listed")
+                fallback_support = (
+                    ["autoskip_power_not_listed"]
+                    if reason == "startup_powers_observe_without_toggle" and powers_autoskip_startup
+                    else ["weak_current_spec_refresh"]
+                )
+                self._record_startup_route(
+                    "continue",
+                    reason=reason,
+                    confidence="marginal",
+                    supports=supports or fallback_support,
+                )
+                self._record_startup_auto_result("observe_without_toggle")
+                self.last_change = time.time()
+                domain_label = "powers" if reason == "startup_powers_observe_without_toggle" else "specs"
+                self.clear_recovery_failures(f"{label} {domain_label} observe without toggle")
+                power_fields = ""
+                if reason == "startup_powers_observe_without_toggle":
+                    power_fields = (
+                        f"powers_autoskip_current={bool(powers_autoskip_startup)} | "
+                    )
+                self.log(
+                    f"[Startup Decide] auto_state={observed_state} | rolling_state={startup_preflight_rolling_state} | "
+                    f"popup_state={startup_popup_state} | decision=skip_toggle_observe_first | "
+                    f"reason={reason} | checkbox_confidence={checkbox_confidence} | "
+                    f"startup_spec_class={startup_spec_class} | {power_fields}"
+                    f"ocr_reason={startup_preflight_support.get('reason', 'none')} | "
+                    f"change_score={startup_preflight_support.get('max_change_score', 0.0)} | "
+                    f"support={'+'.join(supports) or 'none'} | {label}"
+                )
+                self._record_recovery_duration(label, started)
+                return finish(True, STARTUP_CONFIRMED_ROLLING, rolling_confirmed=True)
+
             if compact_non_target_preflight and startup_preflight_rolling_state == "not_rolling" and not startup_popup_state:
                 startup_observed_state = self.auto_checkbox_state()
                 self._log_auto_checkbox_state_read(f"{label} compact startup check", 1, startup_observed_state)
                 self._record_startup_auto_state(startup_observed_state, 1)
+                observe_without_toggle_reason = _startup_observe_without_toggle_reason(startup_observed_state)
+                if observe_without_toggle_reason:
+                    return _finish_startup_observe_without_toggle(observe_without_toggle_reason, startup_observed_state)
                 if startup_observed_state == "enabled":
                     startup_compact_checkbox_mode = "enabled_no_click"
                     auto_enable_result = "already_enabled"
@@ -4583,6 +4768,21 @@ class AelrithForgeBot:
                         f"[Startup Decide] auto_state=enabled_no_click | rolling_state={startup_preflight_rolling_state} | popup_state={startup_popup_state} | "
                         f"decision=continue_without_toggle | reason=compact trusted NON_TARGET preflight stayed not_rolling but Auto already appears enabled; verify behavior next | {label}"
                     )
+                    if powers_autoskip_startup and not self._auto_checkbox_enabled_is_weak():
+                        self._record_startup_route(
+                            "continue",
+                            reason="powers_autoskip_auto_already_enabled",
+                            confidence="strong",
+                            supports=["autoskip_power_not_listed", "auto:enabled"],
+                        )
+                        self._record_recovery_duration(label, started)
+                        self.last_change = time.time()
+                        self.clear_recovery_failures(f"{label} powers autoskip already enabled")
+                        self.log(
+                            f"[Startup Route] powers_autoskip=True | action=continue | "
+                            f"reason=listed Mythical not present and Auto is enabled | {label}"
+                        )
+                        return finish(True, STARTUP_CONFIRMED_ROLLING, rolling_confirmed=True)
                 elif startup_observed_state == "disabled":
                     startup_compact_checkbox_mode = "disabled_clicked"
                     self.log(
@@ -4618,6 +4818,9 @@ class AelrithForgeBot:
                     f"[Startup Observe] auto_state={startup_observed_state} | rolling_state={startup_preflight_rolling_state} | "
                     f"popup_state={startup_popup_state} | phase=decision_inputs"
                 )
+                observe_without_toggle_reason = _startup_observe_without_toggle_reason(startup_observed_state)
+                if observe_without_toggle_reason:
+                    return _finish_startup_observe_without_toggle(observe_without_toggle_reason, startup_observed_state)
                 if startup_observed_state == "enabled":
                     if self._auto_checkbox_enabled_is_weak():
                         self.log(
@@ -4773,6 +4976,19 @@ class AelrithForgeBot:
             ):
                 skip_double_check = True
                 skip_double_check_reason = "compact_enabled_no_click_decisive_nonconfirming_primary"
+                self.log(
+                    f"[Startup Route] double_check_skipped=True | reason={skip_double_check_reason} | "
+                    f"verify_state={auto_verify_state} | {label}"
+                )
+            elif (
+                startup_recovery
+                and powers_autoskip_startup
+                and startup_compact_checkbox_mode == "disabled_clicked"
+                and auto_verify_state in {"not_rolling", "unreadable_static"}
+                and not popup_after_auto
+            ):
+                skip_double_check = True
+                skip_double_check_reason = "powers_autoskip_disabled_click_fast_verify_complete"
                 self.log(
                     f"[Startup Route] double_check_skipped=True | reason={skip_double_check_reason} | "
                     f"verify_state={auto_verify_state} | {label}"
@@ -5046,6 +5262,21 @@ class AelrithForgeBot:
             support_signals = final_support.get("signals") or []
             startup_spec_class = startup_spec_class if startup_recovery else (getattr(self, "_startup_context", {}).get("current_spec_class", "unknown") if self._startup_context_active() else "unknown")
             safe_filler_state = (safe_filler_state if startup_recovery else startup_spec_class == "NON_TARGET filler") and not popup_after_auto
+            if powers_autoskip_startup and followup_state == "enabled":
+                self._record_startup_route(
+                    "continue",
+                    reason="powers_autoskip_enabled_after_bounded_check",
+                    confidence="strong",
+                    supports=support_signals or ["autoskip_power_not_listed", "auto:enabled"],
+                )
+                self.log(
+                    f"{label} powers autoskip accepted enabled Auto after bounded check | "
+                    f"verify_state={final_verify_state} | support={'+'.join(support_signals) or 'auto:enabled'}"
+                )
+                self.last_change = time.time()
+                self.clear_recovery_failures(f"{label} powers autoskip enabled")
+                self._record_recovery_duration(label, started)
+                return finish(True, STARTUP_CONFIRMED_ROLLING, rolling_confirmed=True)
             if followup_state == "enabled" and final_support["strong"]:
                 self._record_startup_route(
                     "continue",
@@ -5069,6 +5300,23 @@ class AelrithForgeBot:
                     "reason=checkbox alone is not enough without supporting behavior evidence"
                 )
                 if safe_filler_state and final_verify_state in ("rolling", "not_rolling", "unreadable_static") and not final_support["strong"]:
+                    if self.roll_domain == "specs":
+                        self._record_startup_route(
+                            "fail_safe",
+                            reason="manual_reroll_blocked_for_non_bad_spec_startup",
+                            confidence="weak",
+                            supports=support_signals or ["enabled_checkbox_only"],
+                            failure_type="non_bad_spec_startup_manual_reroll_blocked",
+                        )
+                        self.log(
+                            f"[Startup Route] fallback_route=fail_safe | route_reason=manual_reroll_blocked_for_non_bad_spec_startup | "
+                            f"decision_confidence=weak | supports={'+'.join(support_signals) or 'enabled_checkbox_only'} | "
+                            f"state={final_verify_state} | trait={self.last_trait_seen or 'unknown'} | "
+                            f"startup_spec_class={startup_spec_class} | auto_state={followup_state} | "
+                            f"popup_confirmed={bool(popup_after_auto or popup_cleared_during_startup)}"
+                        )
+                        self._record_recovery_duration(label, started, success=False)
+                        return finish(False, failed_result("uncertain_existing_state"))
                     self._record_startup_route(
                         "manual_reroll",
                         reason="enabled_checkbox_without_behavior_support_on_safe_filler",
@@ -5290,6 +5538,45 @@ class AelrithForgeBot:
                 f"spec_class={startup_spec_class} | manual_reroll_blocked={str(manual_reroll_blocked)}"
             )
 
+        if (
+            startup_recovery
+            and self.roll_domain == "specs"
+            and not bool(popup_after_auto or popup_cleared_during_startup)
+        ):
+            startup_spec_class = (
+                startup_spec_class
+                if "startup_spec_class" in locals()
+                else (
+                    getattr(self, "_startup_context", {}).get("current_spec_class", "unknown")
+                    if self._startup_context_active()
+                    else "unknown"
+                )
+            )
+            final_verify_state = final_verify_state if "final_verify_state" in locals() else self.last_recovery_verify_state
+            followup_state = followup_state if "followup_state" in locals() else "unknown"
+            self._record_startup_route(
+                "fail_safe",
+                reason="manual_reroll_blocked_for_non_bad_spec_startup",
+                confidence="weak",
+                supports=[
+                    f"state:{final_verify_state or 'unknown'}",
+                    f"auto:{followup_state or 'unknown'}",
+                    f"spec_class:{startup_spec_class or 'unknown'}",
+                ],
+                failure_type="non_bad_spec_startup_manual_reroll_blocked",
+            )
+            self.log(
+                "[Startup Route] fallback_route=fail_safe | "
+                "route_reason=manual_reroll_blocked_for_non_bad_spec_startup | "
+                "decision_confidence=weak | "
+                f"state={final_verify_state or 'unknown'} | trait={self.last_trait_seen or 'unknown'} | "
+                f"startup_spec_class={startup_spec_class or 'unknown'} | auto_state={followup_state or 'unknown'} | "
+                f"popup_confirmed={bool(popup_after_auto or popup_cleared_during_startup)}"
+            )
+            self.log("Manual reroll blocked for Specs startup because no BAD/DISABLED mythical or popup was confirmed")
+            self._record_recovery_duration(label, started, success=False)
+            return finish(False, failed_result(auto_enable_result))
+
         self.log("Auto-roll still not confirmed after double check. Using manual reroll fallback.")
         if self._stop_requested(label):
             self.log("Recovery aborted due to manual stop")
@@ -5481,6 +5768,11 @@ class AelrithForgeBot:
             cleared_settle = transition_profile["cleared_settle"]
             if not self._interruptible_sleep(cleared_settle, "manual reroll cleared settle"):
                 return finish(False)
+            if self.roll_domain == "powers":
+                self.log(
+                    "Manual power reroll popup cleared; treating popup as route confirmation | "
+                    f"{reroll_context}"
+                )
             self._record_timing_event(
                 "manual_reroll_popup_confirm",
                 time.perf_counter() - popup_started,
@@ -7590,20 +7882,30 @@ class AelrithForgeBot:
         completeness = self._power_parse_completeness(power_key, values, passive)
 
         if power_key not in self.enabled_powers:
-            self.log(f"SKIP {power_display_name(power_key).upper()} | Power disabled")
+            self.log(
+                f"AUTOSKIP Power | trait={power_display_name(power_key)} | "
+                f"reason=autoskip_power_not_listed | source={source_name} | quality={quality}"
+            )
             self.record_decision_chain(
                 subsystem="Classification",
-                classification="DISABLED",
-                classification_reason="Power disabled",
+                classification="NON_TARGET",
+                classification_reason="autoskip_power_not_listed",
                 current_trait=power_display_name(power_key),
                 parsed_values=assigned,
-                summary=summary,
+                summary="Power is not enabled in the listed Mythicals; letting Auto continue",
                 power_candidate_source=source_name,
                 power_candidate_quality=quality,
                 power_parse_coherent=completeness["coherent"],
                 power_required_values=completeness["required_values"],
             )
-            return "DISABLED", power_key, summary, text, ["Power disabled"], False
+            return (
+                "NON_TARGET",
+                "non_target_power",
+                "Power is not enabled in the listed Mythicals; letting Auto continue",
+                text,
+                ["Autoskip power"],
+                False,
+            )
 
         if not completeness["coherent"]:
             self.log(
@@ -7698,23 +8000,134 @@ class AelrithForgeBot:
         return "BAD", power_key, summary, text, list(missing), near
 
     def check_power_roll(self, allow_fallback=True, startup_fast=False):
-        candidates = self.get_stats_ocr_candidates(startup_fast=startup_fast)
+        started = time.perf_counter()
+        candidates = []
+        fallback_text = ""
+        primary_route = "startup_fast" if startup_fast else "fast_loop"
+        fast_candidates = self.get_stats_ocr_candidates(
+            startup_fast=startup_fast,
+            fast_loop=not startup_fast,
+        )
+        candidates.extend(fast_candidates)
+        parsed, fallback_text = self._parse_power_candidates(candidates)
+        fallback_reason = ""
+
+        if parsed:
+            completeness = self._power_parse_completeness(
+                parsed["power"],
+                parsed["values"],
+                parsed.get("passive"),
+            )
+            enabled_power = parsed["power"] in self.enabled_powers
+            if completeness["coherent"] or not enabled_power or not allow_fallback:
+                self._record_timing_event(
+                    "check_roll",
+                    time.perf_counter() - started,
+                    domain="powers",
+                    route=primary_route,
+                    fallback="skipped",
+                    power=parsed["power"],
+                    coherent=bool(completeness["coherent"]),
+                )
+                return self.evaluate_power_trait_with_values(
+                    parsed["power"],
+                    parsed["values"],
+                    parsed["text"],
+                    source_name=parsed["engine"],
+                    passive=parsed.get("passive"),
+                )
+            fallback_reason = "enabled_power_parse_incomplete"
+        elif fallback_text:
+            self.log(
+                "AUTOSKIP Power | trait=unsupported_or_filler | reason=autoskip_power_not_listed | "
+                f"source={primary_route}"
+            )
+            self.record_decision_chain(
+                subsystem="Classification",
+                classification="NON_TARGET",
+                classification_reason="autoskip_power_not_listed",
+                current_trait="Non-target Power",
+                parsed_values={},
+                summary="Unsupported or filler power observed; letting Auto continue",
+            )
+            self._record_timing_event(
+                "check_roll",
+                time.perf_counter() - started,
+                domain="powers",
+                route=primary_route,
+                fallback="skipped",
+                power="unsupported_or_filler",
+            )
+            return "NON_TARGET", "non_target_power", "Unsupported or filler power observed; letting Auto continue", fallback_text, ["Non-target power"], False
+        else:
+            fallback_reason = "fast_power_parse_missing"
+
         if allow_fallback:
+            primary_candidates = []
+            if not startup_fast:
+                primary_candidates = self.get_stats_ocr_candidates(startup_fast=False)
+                if primary_candidates:
+                    candidates = candidates + primary_candidates
+                    parsed, fallback_text = self._parse_power_candidates(candidates)
+                    if parsed:
+                        completeness = self._power_parse_completeness(
+                            parsed["power"],
+                            parsed["values"],
+                            parsed.get("passive"),
+                        )
+                        enabled_power = parsed["power"] in self.enabled_powers
+                        if completeness["coherent"] or not enabled_power:
+                            self.log(
+                                "Power OCR fast-loop promoted to primary route | "
+                                f"reason={fallback_reason} | power={power_display_name(parsed['power'])} | "
+                                f"coherent={completeness['coherent']}"
+                            )
+                            self._record_timing_event(
+                                "check_roll",
+                                time.perf_counter() - started,
+                                domain="powers",
+                                route="primary_after_fast",
+                                fallback="skipped",
+                                power=parsed["power"],
+                                coherent=bool(completeness["coherent"]),
+                            )
+                            return self.evaluate_power_trait_with_values(
+                                parsed["power"],
+                                parsed["values"],
+                                parsed["text"],
+                                source_name=parsed["engine"],
+                                passive=parsed.get("passive"),
+                            )
+                        fallback_reason = "primary_power_parse_incomplete"
             fallback_candidates = self.get_stats_ocr_candidates(fallback_only=True)
             if fallback_candidates:
                 candidates = candidates + fallback_candidates
+                parsed, fallback_text = self._parse_power_candidates(candidates)
+                if parsed:
+                    self.log(
+                        "Power OCR fallback used | "
+                        f"reason={fallback_reason or 'fast_parse_not_coherent'} | "
+                        f"power={power_display_name(parsed['power'])}"
+                    )
 
-        parsed, fallback_text = self._parse_power_candidates(candidates)
         if not parsed:
             if fallback_text:
-                self.log("CURRENT POWER gate | supported mythical not detected; treating current power as non-target filler")
+                self.log("AUTOSKIP Power | trait=unsupported_or_filler | reason=autoskip_power_not_listed | source=ocr_fallback")
                 self.record_decision_chain(
                     subsystem="Classification",
                     classification="NON_TARGET",
-                    classification_reason="unsupported or filler power outside supported mythical foundation set",
+                    classification_reason="autoskip_power_not_listed",
                     current_trait="Non-target Power",
                     parsed_values={},
                     summary="Unsupported or filler power observed; letting Auto continue",
+                )
+                self._record_timing_event(
+                    "check_roll",
+                    time.perf_counter() - started,
+                    domain="powers",
+                    route="fallback",
+                    fallback="used",
+                    power="unsupported_or_filler",
                 )
                 return "NON_TARGET", "non_target_power", "Unsupported or filler power observed; letting Auto continue", fallback_text, ["Non-target power"], False
             self.record_decision_chain(
@@ -7724,8 +8137,24 @@ class AelrithForgeBot:
                 current_trait="none",
                 parsed_values={},
             )
+            self._record_timing_event(
+                "check_roll",
+                time.perf_counter() - started,
+                domain="powers",
+                route="fallback" if allow_fallback else primary_route,
+                fallback="used" if allow_fallback else "disabled",
+                power="none",
+            )
             return "ROLLING", None, "", "", [], False
 
+        self._record_timing_event(
+            "check_roll",
+            time.perf_counter() - started,
+            domain="powers",
+            route="fallback" if allow_fallback else primary_route,
+            fallback="used" if allow_fallback else "disabled",
+            power=parsed["power"],
+        )
         return self.evaluate_power_trait_with_values(
             parsed["power"],
             parsed["values"],
@@ -8172,6 +8601,30 @@ class AelrithForgeBot:
         priority = {"threshold": 0, "contrast": 1, "gray": 2, "raw": 3}
         return min(valid, key=lambda item: (priority.get(item.get("mode"), 9), item.get("psm", 9), -int(item["parsed"])))
 
+    def _passive_shard_offtarget_reason(self, attempts):
+        if self.roll_domain != "powers":
+            return ""
+        raw_text = " ".join(str(attempt.get("raw") or "") for attempt in attempts or [])
+        normalized = normalize_text(raw_text)
+        if not normalized or re.search(r"\d", normalized):
+            return ""
+        roll_tokens = (
+            "mythi",
+            "mythic",
+            "non target",
+            "non-target",
+            "power",
+            "damage",
+            "crit",
+            "luck",
+            "colossus",
+            "cursebrand",
+            "subjugator",
+        )
+        if any(token in normalized for token in roll_tokens):
+            return "off_target_roll_text"
+        return ""
+
     def read_passive_shards(self):
         if not self.passive_shard_region_enabled():
             if not self._passive_shard_region_warned:
@@ -8180,6 +8633,18 @@ class AelrithForgeBot:
             return None
 
         region = tuple(self.cfg["PASSIVE_SHARD_REGION"])
+        now = time.time()
+        if self.roll_domain == "powers" and now < float(self._passive_shard_backoff_until or 0.0):
+            remaining = int(max(0.0, float(self._passive_shard_backoff_until or 0.0) - now))
+            self._log_with_cooldown(
+                "passive_shard_backoff_active",
+                "Passive shard OCR skipped during Powers mode backoff | "
+                f"reason={self._passive_shard_backoff_reason or 'recent failure'} | "
+                f"remaining={remaining}s | keeping={format_shard_count(self.last_passive_shards) if self.last_passive_shards is not None else 'unknown'}",
+                cooldown=10.0,
+            )
+            return self.last_passive_shards
+
         try:
             result = self.passive_shard_ocr_attempts(region=region)
         except Exception as e:
@@ -8225,6 +8690,8 @@ class AelrithForgeBot:
         )
         if best is not None:
             count = int(best["parsed"])
+            self._passive_shard_backoff_until = 0.0
+            self._passive_shard_backoff_reason = ""
             self.log(
                 "Passive shard OCR accepted | "
                 f"raw={self._compact_debug_text(best.get('raw')) or '<empty>'} | "
@@ -8240,6 +8707,17 @@ class AelrithForgeBot:
         reasons = ", ".join(sorted({attempt["reason"] for attempt in attempts})) or "no attempts"
         if "suspicious zero" in reasons:
             self.log("Passive shard OCR suspicious zero rejected")
+        off_target_reason = self._passive_shard_offtarget_reason(attempts)
+        if off_target_reason:
+            cooldown = min(180.0, max(45.0, float(self.cfg.get("PASSIVE_SHARD_REPORT_INTERVAL", 600)) / 4.0))
+            self._passive_shard_backoff_until = time.time() + cooldown
+            self._passive_shard_backoff_reason = off_target_reason
+            self._log_with_cooldown(
+                "passive_shard_offtarget_backoff",
+                "Passive shard OCR appears pointed at roll text; backing off repeated reads | "
+                f"reason={off_target_reason} | cooldown={int(cooldown)}s | region={region}",
+                cooldown=10.0,
+            )
         self.log(f"Passive shard OCR rejected as garbage or did not find a count | region={region} | reasons={reasons}")
         if self.last_passive_shards is not None:
             self.log(f"Passive shard OCR failed; keeping previous valid value {format_shard_count(self.last_passive_shards)}")
@@ -8353,6 +8831,122 @@ class AelrithForgeBot:
                 lines.append("")
             lines.append(str(footer).strip())
         return "\n".join(lines).strip()
+
+    def _format_near_miss_number(self, value):
+        try:
+            return f"{float(value):g}"
+        except Exception:
+            text = str(value or "").strip()
+            return text or "?"
+
+    def _format_near_miss_range(self, low, high):
+        return f"{self._format_near_miss_number(low)}–{self._format_near_miss_number(high)}"
+
+    def _parse_near_miss_detail(self, miss_text, distance=""):
+        detail = {
+            "label": str(miss_text or "Target").split(":", 1)[0].split("|", 1)[0].strip() or "Target",
+            "rolled": "not read",
+            "needed": "configured target",
+            "gap": distance or "near target",
+        }
+        for piece in re.split(r"\s*\|\s*", str(miss_text or "")):
+            match = re.match(
+                r"\s*(?P<label>[^:]+):\s*(?P<rolled>not found|[-+]?\d+(?:\.\d+)?)\s*->\s*"
+                r"(?P<low>[-+]?\d+(?:\.\d+)?)\s*-\s*(?P<high>[-+]?\d+(?:\.\d+)?)",
+                piece,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                continue
+            label = match.group("label").strip()
+            rolled_text = match.group("rolled").strip()
+            low = float(match.group("low"))
+            high = float(match.group("high"))
+            gap = "not read"
+            if rolled_text.lower() != "not found":
+                rolled = float(rolled_text)
+                if rolled < low:
+                    gap = f"-{low - rolled:g}"
+                elif rolled > high:
+                    gap = f"+{rolled - high:g}"
+                else:
+                    gap = "0"
+            return {
+                "label": label,
+                "rolled": rolled_text,
+                "needed": self._format_near_miss_range(low, high),
+                "gap": gap,
+            }
+        return detail
+
+    def _near_miss_row_lines(self, rows):
+        clean_rows = [(str(label).strip(), self._format_near_miss_number(value)) for label, value in rows if str(label).strip()]
+        if not clean_rows:
+            return ["Result          not read"]
+        label_width = max(14, *(len(label) for label, _value in clean_rows))
+        return [f"{label:<{label_width}} {value:>5}" for label, value in clean_rows]
+
+    def _near_miss_spec_rows(self, trait, summary):
+        labels = STAT_LABELS.get(trait, [])
+        values = self.extract_labeled_values(trait, summary) if labels else []
+        rows = []
+        for index, label in enumerate(labels):
+            value = values[index] if index < len(values) else None
+            rows.append((label, "?" if value is None else value))
+        return rows
+
+    def _near_miss_power_rows(self, summary):
+        rows = []
+        for part in re.split(r"\s*\|\s*", str(summary or "")):
+            text = part.strip()
+            if not text:
+                continue
+            match = re.match(
+                r"(?P<label>.+?)\s+"
+                r"(?P<value>not found|\?|[-+]?\d+(?:\.\d+)?(?:\s+[-+]?\d+(?:\.\d+)?s|s)?)$",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                label = re.sub(r"\s*\(optional\)", "", match.group("label").strip(), flags=re.IGNORECASE)
+                rows.append((label, match.group("value").strip()))
+            else:
+                rows.append((text, "?"))
+        return rows
+
+    def _near_miss_stat_rows(self, trait, summary):
+        if trait in SUPPORTED_POWER_DEFINITIONS:
+            return self._near_miss_power_rows(summary)
+        return self._near_miss_spec_rows(trait, summary)
+
+    def _near_miss_discord_body(self, trait, summary, miss_text, distance):
+        trait_name = display_trait(trait)
+        miss = self._parse_near_miss_detail(miss_text, distance)
+        lines = [
+            "# Kon. Near Miss",
+            "━━━━━━━━━━━━━━━━━━━━━━━",
+            f"{trait_name} was close, but skipped.",
+            "",
+            "```",
+            "Stat Result",
+        ]
+        lines.extend(self._near_miss_row_lines(self._near_miss_stat_rows(trait, summary)))
+        lines.extend(
+            [
+                "",
+                "Missed:",
+                miss["label"],
+                f"Rolled: {self._format_near_miss_number(miss['rolled'])}",
+                f"Needed: {miss['needed']}",
+                f"Gap: {miss['gap']}",
+                "",
+                "Session:",
+                f"Uptime: {self._format_uptime()}",
+                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "```",
+            ]
+        )
+        return "\n".join(lines)
 
     def _webhook_should_send(self, key, window=None):
         if not key:
@@ -8551,7 +9145,9 @@ class AelrithForgeBot:
         dedup=True,
         use_ping=True,
     ):
-        content = body if str(body).startswith(APP_DISPLAY_NAME) else self._discord_message(title, footer=body)
+        body_text = str(body)
+        raw_markdown = body_text.startswith("# Kon. Near Miss")
+        content = body_text if body_text.startswith(APP_DISPLAY_NAME) or raw_markdown else self._discord_message(title, footer=body_text)
         dedup_key = event_key if dedup and not critical else None
         if dedup_key and not self._webhook_should_send(dedup_key):
             return False
@@ -8601,19 +9197,7 @@ class AelrithForgeBot:
         self.session_near_misses += 1
         self.last_trait_seen = trait or self.last_trait_seen
         self.last_important_event = f"Near miss: {display_trait(trait)}"
-        body = (
-            self._discord_message(
-                "Near Miss Found",
-                fields=[
-                    ("Trait", display_trait(trait)),
-                    ("Rolled", summary),
-                    ("Missed", miss_text),
-                    ("Closeness", distance or "near configured target"),
-                    ("Uptime", self._format_uptime()),
-                    ("Timestamp", time.strftime("%Y-%m-%d %H:%M:%S")),
-                ],
-            )
-        )
+        body = self._near_miss_discord_body(trait, summary, miss_text, distance)
         key = f"near_miss:{trait}:{distance or miss_text}"
         return self.send_webhook_alert(key, "Near Miss Found", body, dedup=True, use_ping=False)
 
@@ -9255,6 +9839,22 @@ class AelrithForgeBot:
         if fast_state == "NON_TARGET":
             self.last_trait_seen = fast_trait or self.last_trait_seen
             self._record_startup_spec_class("NON_TARGET filler")
+            if self.roll_domain == "powers":
+                if self._startup_context_active():
+                    self._startup_context["powers_autoskip_current"] = True
+                    self._startup_context["preflight_bypassed"] = True
+                    self._startup_context["preflight_fallback_reason"] = "autoskip_power"
+                self._record_startup_route(
+                    "continue",
+                    reason="startup_fast_power_autoskip",
+                    confidence="strong",
+                    supports=["autoskip_power_not_listed"],
+                )
+                self.log(
+                    "Startup fast current power is AUTOSKIP/NON_TARGET; "
+                    "skipping trust probe and slower full current-spec scan"
+                )
+                return "continue"
             popup_known_clear = bool(getattr(self, "_startup_context", {}).get("startup_popup_clear_known")) if self._startup_context_active() else False
             popup_visible = False if popup_known_clear else self._popup_active_checked(
                 log=True,
@@ -9404,6 +10004,7 @@ class AelrithForgeBot:
                     trait,
                     missing,
                     context="Startup Power BAD manual reroll",
+                    fast_first=bool(fast_power_support.get("strong")),
                 ):
                     self.log(
                         "Startup current power BAD was not stable enough for manual reroll; "
@@ -9615,7 +10216,14 @@ class AelrithForgeBot:
             )
 
         while not self.stop_event.is_set():
+            loop_started = time.perf_counter()
+            shard_elapsed = 0.0
+            check_elapsed = 0.0
+            bad_confirm_elapsed = 0.0
+            manual_elapsed = 0.0
+            loop_state = "unknown"
             try:
+                shard_started = time.perf_counter()
                 if "passive" in self._startup_shard_prime_pending:
                     self.maybe_report_passive_shards(force=True)
                     self._startup_shard_prime_pending.discard("passive")
@@ -9641,8 +10249,12 @@ class AelrithForgeBot:
                         self.log("Stopping macro: power shards exhausted")
                         self.alert_macro_stopped("Power shards are exhausted, so rolling cannot continue.")
                         break
+                shard_elapsed = time.perf_counter() - shard_started
 
+                check_started = time.perf_counter()
                 state, trait, summary, ocr_text, missing, near = self.check_roll()
+                check_elapsed = time.perf_counter() - check_started
+                loop_state = state or "unknown"
                 if trait:
                     self.last_trait_seen = trait
 
@@ -9757,17 +10369,33 @@ class AelrithForgeBot:
                         self._set_terminal_stop_reason(f"High value roll: {display_trait(trait)}")
                         self.set_status(f"HIGH VALUE | {display_trait(trait)}")
                         break
-                    if self.roll_domain == "powers" and state == "BAD" and not self._confirm_power_bad_before_manual_reroll(
-                        trait,
-                        missing,
-                        context="Loop Power BAD manual reroll",
-                    ):
-                        self.set_status("ROLLING | Power BAD confirmation deferred")
-                        if not self._interruptible_sleep(self.cfg["LOOP_DELAY"], "deferred power BAD loop delay"):
-                            break
-                        continue
+                    if self.roll_domain == "powers" and state == "BAD":
+                        confirm_started = time.perf_counter()
+                        fast_confirm = self._power_bad_fast_confirm_allowed(trait)
+                        confirmed_bad = self._confirm_power_bad_before_manual_reroll(
+                            trait,
+                            missing,
+                            context="Loop Power BAD manual reroll",
+                            fast_first=fast_confirm,
+                        )
+                        bad_confirm_elapsed = time.perf_counter() - confirm_started
+                        self._record_timing_event(
+                            "bad_confirm",
+                            bad_confirm_elapsed,
+                            domain="powers",
+                            route="fast" if fast_confirm else "fallback",
+                            result="confirmed" if confirmed_bad else "deferred",
+                            trait=power_display_name(trait) if trait else "unknown",
+                        )
+                        if not confirmed_bad:
+                            self.set_status("ROLLING | Power BAD confirmation deferred")
+                            if not self._interruptible_sleep(self.cfg["LOOP_DELAY"], "deferred power BAD loop delay"):
+                                break
+                            continue
                     reroll_reason = f"bad power {trait}" if self.roll_domain == "powers" else f"bad {trait}"
+                    manual_started = time.perf_counter()
                     if not self.manual_reroll_flow(reroll_reason):
+                        manual_elapsed = time.perf_counter() - manual_started
                         if self.recovery_failed_should_stop(
                             "Manual Reroll Auto Resume",
                             self._manual_reroll_failure_reason(),
@@ -9775,6 +10403,7 @@ class AelrithForgeBot:
                             self.alert_macro_stopped("Manual reroll could not safely resume Auto after repeated attempts. Check Auto, OCR, and button positions.")
                             break
                         continue
+                    manual_elapsed = time.perf_counter() - manual_started
                 else:
                     self.set_status(f"ROLLING | {current_text[:48]}")
 
@@ -9854,6 +10483,25 @@ class AelrithForgeBot:
                                 self.alert_macro_stopped("No stat change after repeated recovery attempts. Check the OCR region, button positions, and passive shards.")
                                 break
 
+                total_elapsed = time.perf_counter() - loop_started
+                self._record_timing_event(
+                    "loop_total",
+                    total_elapsed,
+                    state=loop_state,
+                    check_roll_ms=int(check_elapsed * 1000),
+                    bad_confirm_ms=int(bad_confirm_elapsed * 1000),
+                    manual_popup_auto_ms=int(manual_elapsed * 1000),
+                    shards_ms=int(shard_elapsed * 1000),
+                )
+                if total_elapsed >= 2.0 or time.time() - self._last_loop_perf_log >= 30.0:
+                    self._last_loop_perf_log = time.time()
+                    self.log(
+                        "Loop timing | "
+                        f"state={loop_state} | check_roll={int(check_elapsed * 1000)}ms | "
+                        f"bad_confirm={int(bad_confirm_elapsed * 1000)}ms | "
+                        f"manual_popup_auto={int(manual_elapsed * 1000)}ms | "
+                        f"shards={int(shard_elapsed * 1000)}ms | total={int(total_elapsed * 1000)}ms"
+                    )
                 if not self._interruptible_sleep(self.cfg["LOOP_DELAY"], "main loop delay"):
                     break
                 self.maybe_update_live_status("running")
