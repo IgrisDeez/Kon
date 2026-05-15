@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.101
+
+- Added GitHub Release update checks for portable Kon. builds with a user-approved install prompt.
+- Added a portable release build script, updater installer script, PyInstaller asset packaging, and GitHub Actions release workflow.
+- Documented portable ZIP installation, preserved local files during updates, and maintainer release publishing steps.
+
 ## v1.100.25
 
 - Fixed Power Shards OCR parsing so compact million reads like `1.37M` are accepted instead of being overridden by stale low values.

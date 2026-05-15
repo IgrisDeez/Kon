@@ -12,6 +12,7 @@ except ModuleNotFoundError:
 
 from aelrith_forge import APP_DISPLAY_NAME, APP_VERSION
 from aelrith_forge.backend.controller import BotController
+from aelrith_forge.ui import main_window as main_window_module
 from aelrith_forge.ui.main_window import MainWindow
 from aelrith_forge.ui.pages.logs_page import LogsPage
 from aelrith_forge.ui.pages.powers_page import PowersPage
@@ -110,6 +111,20 @@ class UiWidgetTests(unittest.TestCase):
         self.assertEqual(window.preview_capture_notice.text(), "Preview restored")
         self.assertTrue(hasattr(window.main_page, "macro_health_value"))
         self.assertTrue(hasattr(window.tools_page, "macro_timing_readout"))
+
+    def test_main_window_skips_auto_update_check_in_source_runtime(self):
+        old_check = main_window_module.updater.is_portable_runtime
+        main_window_module.updater.is_portable_runtime = lambda: False
+        try:
+            controller = BotController()
+            window = MainWindow(controller)
+            self.addCleanup(window.close)
+
+            window.check_for_updates_on_startup()
+
+            self.assertFalse(window._update_check_started)
+        finally:
+            main_window_module.updater.is_portable_runtime = old_check
 
     def test_main_page_mode_badges_track_display_and_running_state(self):
         controller = BotController()

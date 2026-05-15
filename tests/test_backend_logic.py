@@ -349,6 +349,7 @@ class BackendLogicTests(unittest.TestCase):
 
     def test_activity_detection_accepts_stat_number_change_without_current_spec(self):
         bot = ActivityStubBot(["DamageI>Damage6.7%", "DamageI>Damage6.8%"])
+        bot._ocr_tesseract_image = lambda _image, psm=7: bot.ocr_region(None, psm=psm)
         changed, sample = bot.stats_changed("DamageI>Damage6.7%", context="unit activity")
         self.assertFalse(changed)
         self.assertEqual(sample, "DamageI>Damage6.7%")

@@ -1,0 +1,63 @@
+name: Build Portable Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  portable:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run focused tests
+        shell: pwsh
+        run: python -m pytest tests/test_parser_safety_harness.py tests/test_backend_logic.py tests/test_updater.py -q
+
+      - name: Build portable ZIP
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/build_portable_release.ps1
+
+      - name: Resolve release metadata
+        shell: pwsh
+        run: |
+          $version = python -c "from aelrith_forge.version import APP_VERSION; print(APP_VERSION)"
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "RELEASE_TAG=$version" >> $env:GITHUB_ENV
+          } else {
+            "RELEASE_TAG=${{ github.ref_name }}" >> $env:GITHUB_ENV
+          }
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kon-${{ env.APP_VERSION }}-portable
+          path: dist/releases/Kon-${{ env.APP_VERSION }}-portable.zip
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Kon. ${{ env.RELEASE_TAG }}
+          files: dist/releases/Kon-${{ env.APP_VERSION }}-portable.zip
+          generate_release_notes: true

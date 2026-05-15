@@ -8,11 +8,15 @@ hiddenimports = [
     "PIL.ImageQt",
 ]
 
+datas = [
+    ("aelrith_forge/ui/assets/af_logo.png", "aelrith_forge/ui/assets"),
+]
+
 a = Analysis(
     ["run_aelrith_forge.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

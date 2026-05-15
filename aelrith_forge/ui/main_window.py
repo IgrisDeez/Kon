@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from .. import APP_BRAND_NAME, APP_CONSOLE_LABEL, APP_DISPLAY_NAME, APP_VERSION
 from ..backend.bot import STAT_CAPS, STAT_LABELS
+from ..backend import updater
 from ..backend.powers import POWER_DEFAULT_RULES, SUPPORTED_POWER_DEFINITIONS
 from ..backend.controller import BotController, format_point, format_region
 from .pages.logs_page import LogsPage
@@ -37,6 +39,9 @@ from .widgets.cards import StatusStrip, label
 
 
 class MainWindow(QMainWindow):
+    update_check_finished = Signal(object)
+    update_download_finished = Signal(object)
+
     def __init__(self, controller: BotController):
         super().__init__()
         self.controller = controller
@@ -44,9 +49,13 @@ class MainWindow(QMainWindow):
         self.resize(940, 640)
         self.setMinimumSize(780, 540)
         self._session_started_at: float | None = None
+        self._update_check_started = False
+        self._update_install_pending = False
 
         self._build_shell()
         self._connect_signals()
+        self.update_check_finished.connect(self._handle_update_check_result)
+        self.update_download_finished.connect(self._handle_update_download_result)
         self._load_settings(self.controller.settings)
         self._set_history(self.controller.god_rolls, self.controller.near_misses)
         self._load_existing_logs_into_ui()
@@ -54,6 +63,7 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self._tick_timer)
+        QTimer.singleShot(2500, self.check_for_updates_on_startup)
 
     def _build_shell(self):
         root = QWidget()
@@ -222,6 +232,96 @@ class MainWindow(QMainWindow):
         existing = self.controller.recent_log_entries(260)
         self.logs_page.load_log_entries(existing)
         self.main_page.load_event_entries(existing)
+
+    def check_for_updates_on_startup(self):
+        if self._update_check_started or not updater.is_portable_runtime():
+            return
+        self._update_check_started = True
+        self.controller.add_log("Checking GitHub Releases for Kon. updates...")
+        thread = threading.Thread(target=self._run_update_check, name="kon-update-check", daemon=True)
+        thread.start()
+
+    def _run_update_check(self):
+        result = updater.check_for_update()
+        self.update_check_finished.emit(result)
+
+    def _handle_update_check_result(self, result):
+        if getattr(result, "status", "") == "available":
+            self.controller.add_log(
+                f"Update available | current={result.current_version} | latest={result.latest_version} | asset={result.asset_name}"
+            )
+            self._prompt_for_update(result)
+            return
+        if getattr(result, "status", "") == "failed":
+            self.controller.add_log(f"Update check skipped or failed | {getattr(result, 'message', '')}")
+            return
+        self.controller.add_log(getattr(result, "message", "") or "Kon. is up to date.")
+
+    def _prompt_for_update(self, result):
+        if self.controller.bot.running:
+            QMessageBox.information(
+                self,
+                "Update Available",
+                f"Kon. {result.latest_version} is available.\n\nStop the bot before installing the update.",
+            )
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Update Available")
+        box.setText(f"Kon. {result.latest_version} is available.")
+        notes = result.notes or "No release notes were provided."
+        box.setInformativeText(
+            f"Current version: {result.current_version}\n"
+            f"Latest version: {result.latest_version}\n\n"
+            f"{notes[:900]}"
+        )
+        install_button = box.addButton("Install Update", QMessageBox.ButtonRole.AcceptRole)
+        release_button = box.addButton("Open Release Page", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(install_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == install_button:
+            self._download_and_install_update(result)
+        elif clicked == release_button and result.release_url:
+            QDesktopServices.openUrl(QUrl(result.release_url))
+
+    def _download_and_install_update(self, result):
+        if self.controller.bot.running:
+            QMessageBox.information(self, "Update", "Stop the bot before installing an update.")
+            return
+        if self._update_install_pending:
+            return
+        self._update_install_pending = True
+        self.controller.add_log(f"Downloading Kon. update {result.latest_version}...")
+        thread = threading.Thread(target=self._run_update_download, args=(result,), name="kon-update-download", daemon=True)
+        thread.start()
+
+    def _run_update_download(self, result):
+        try:
+            zip_path = updater.download_release_asset(result, updater.update_cache_dir())
+            self.update_download_finished.emit({"ok": True, "zip_path": str(zip_path), "result": result})
+        except Exception as exc:
+            self.update_download_finished.emit({"ok": False, "error": str(exc), "result": result})
+
+    def _handle_update_download_result(self, payload):
+        self._update_install_pending = False
+        if not payload.get("ok"):
+            error = payload.get("error", "Download failed.")
+            self.controller.add_log(f"Update download failed | {error}")
+            QMessageBox.warning(self, "Update Failed", error)
+            return
+        zip_path = Path(payload["zip_path"])
+        result = payload.get("result")
+        try:
+            updater.launch_updater(zip_path)
+        except Exception as exc:
+            self.controller.add_log(f"Update installer failed to start | {exc}")
+            QMessageBox.warning(self, "Update Failed", str(exc))
+            return
+        version = getattr(result, "latest_version", "latest")
+        self.controller.add_log(f"Kon. updater launched for {version}; closing app for install.")
+        self.close()
 
     def _sync_line_edits(self, left, right):
         def push_to_right(text):

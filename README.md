@@ -8,15 +8,29 @@ The Python package is still named `aelrith_forge` for compatibility with existin
 
 ## Download
 
-For normal users, use the GitHub page:
+For normal users, use the portable ZIP from GitHub Releases:
 
 1. Open the repository on GitHub.
-2. Click `Code`.
-3. Click `Download ZIP`.
+2. Open `Releases`.
+3. Download `Kon-vX-portable.zip`.
 4. Extract the ZIP somewhere permanent, such as `Documents\Kon`.
-5. Open the extracted folder before running the launcher.
+5. Run `Kon.exe`.
 
-If a packaged release is available, download the release ZIP or EXE instead. Releases are easier for non-developers because they do not need the source setup steps below.
+Do not download the source ZIP unless you are setting up the project for development. The portable ZIP is the plug-and-play build.
+
+## Auto Updates
+
+The portable build checks GitHub Releases when Kon. starts. If a newer stable portable ZIP is available, Kon. shows an update prompt with the current version, latest version, and release notes.
+
+Updates are user-approved. Kon. will not install an update while the macro is running. During an update, local runtime data is preserved:
+
+- `config/`
+- `output/`
+- local webhook settings
+- saved regions and click points
+- logs, screenshots, OCR dumps, and diagnostics
+
+If an update install fails, the updater attempts to restore the previous app files and relaunch Kon.
 
 ## Requirements
 
@@ -73,6 +87,20 @@ You can also launch directly from PowerShell:
 ```powershell
 python -m aelrith_forge
 ```
+
+## Publishing A Portable Release
+
+Maintainers can build the release ZIP locally:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
+powershell -ExecutionPolicy Bypass -File scripts/build_portable_release.ps1
+```
+
+The ZIP is written to `dist/releases/Kon-vX-portable.zip`.
+
+GitHub Actions also builds and uploads the same portable ZIP when a `v*` tag is pushed or the release workflow is run manually. The app updater only installs ZIP assets that match `Kon-*-portable.zip`.
 
 ## First-Time Setup In The App
 
