@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.100.24
+
+- Reworked the README into a clearer user setup guide with download, source install, first-run setup, Discord webhook setup, and troubleshooting steps.
+- Documented the local-only Discord webhook file and clarified what God Roll and Near Miss alert sections mean.
+
 ## v1.100.23
 
 - Moved Discord webhook URL, ping, and delivery preferences into local-only webhook settings storage.
