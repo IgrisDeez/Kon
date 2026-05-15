@@ -708,7 +708,7 @@ class AutoEnableSafetyTests(unittest.TestCase):
         self.assertEqual(clicks, [])
         self.assertTrue(any("skipped ambiguous checkbox recovery because rolling evidence returned during guard" in message for message in messages))
 
-    def test_startup_rejects_trait_only_confirmation_and_uses_guarded_click(self):
+    def test_startup_rejects_trait_only_confirmation_and_blocks_guarded_click(self):
         messages = []
         bot = self.make_bot(messages)
         bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
@@ -761,12 +761,11 @@ class AutoEnableSafetyTests(unittest.TestCase):
 
         result = bot.start_or_recover("Initial Auto Start")
 
-        self.assertTrue(result)
-        self.assertEqual(bot.last_startup_result, "confirmed_rolling")
-        self.assertEqual(len(clicks), 1)
-        self.assertEqual(clicks[0][0][1], "Initial Auto Start Guarded Startup Enable")
+        self.assertFalse(result)
+        self.assertEqual(bot.last_startup_result, "failed_no_roll_detected")
+        self.assertEqual(clicks, [])
         self.assertTrue(any("marker-only or weak rolling evidence rejected | phase=primary | reason=trait_changed:rampage" in message for message in messages))
-        self.assertTrue(any("decision=guarded_enable_click" in message for message in messages))
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
 
 
     def test_watchdog_recovery_stage_uses_bounded_fast_verify_profile(self):

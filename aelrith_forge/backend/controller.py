@@ -73,6 +73,17 @@ from .paths import (
 LOG_FILE = RUNTIME_LOG_FILE
 LIVE_PROOF_DIR = DIAGNOSTIC_DIR / "live_proof"
 CURRENT_SETTINGS_VERSION = SETTINGS_SCHEMA_VERSION
+WEBHOOK_SETTINGS_FILE_NAME = "aelrith_forge_webhook.local.json"
+WEBHOOK_SETTING_KEYS = {
+    "webhook_url",
+    "player_ping",
+    "delete_screenshots_after_webhook",
+    "webhook_live_status_enabled",
+    "webhook_status_update_interval",
+    "webhook_failure_screenshots",
+    "webhook_screenshot_on_popup_stuck",
+    "webhook_screenshot_on_macro_stop",
+}
 REMOVED_SETTINGS_KEYS = {
     "easyocr_enabled",
     "easyocr_fallback",
@@ -244,6 +255,20 @@ def default_settings() -> dict:
             "compact_tables": True,
             "show_session_timer": True,
         },
+    }
+
+
+def default_webhook_settings() -> dict:
+    cfg = DEFAULT_CONFIG
+    return {
+        "webhook_url": "",
+        "player_ping": "",
+        "delete_screenshots_after_webhook": bool(cfg["DELETE_SCREENSHOTS_AFTER_WEBHOOK"]),
+        "webhook_live_status_enabled": bool(cfg["WEBHOOK_LIVE_STATUS_ENABLED"]),
+        "webhook_status_update_interval": int(cfg["WEBHOOK_STATUS_UPDATE_INTERVAL"]),
+        "webhook_failure_screenshots": bool(cfg["WEBHOOK_FAILURE_SCREENSHOTS"]),
+        "webhook_screenshot_on_popup_stuck": bool(cfg["WEBHOOK_SCREENSHOT_ON_POPUP_STUCK"]),
+        "webhook_screenshot_on_macro_stop": bool(cfg["WEBHOOK_SCREENSHOT_ON_MACRO_STOP"]),
     }
 
 
@@ -433,6 +458,56 @@ class BotController(QObject):
         data["powers_rules"] = sanitize_power_rules(data.get("powers_rules") or power_defaults["powers_rules"])
         return data
 
+    def _webhook_settings_file(self) -> Path:
+        return SETTINGS_FILE.parent / WEBHOOK_SETTINGS_FILE_NAME
+
+    def _extract_webhook_settings(self, raw: dict | None) -> dict:
+        data = default_webhook_settings()
+        raw = raw or {}
+        for key in WEBHOOK_SETTING_KEYS:
+            if key in raw:
+                data[key] = raw[key]
+        data["webhook_url"] = str(data.get("webhook_url", "")).strip()
+        data["player_ping"] = str(data.get("player_ping", "")).strip()
+        data["delete_screenshots_after_webhook"] = bool(data.get("delete_screenshots_after_webhook", True))
+        data["webhook_live_status_enabled"] = bool(data.get("webhook_live_status_enabled", True))
+        data["webhook_status_update_interval"] = int(
+            data.get("webhook_status_update_interval", DEFAULT_CONFIG["WEBHOOK_STATUS_UPDATE_INTERVAL"])
+        )
+        data["webhook_failure_screenshots"] = bool(data.get("webhook_failure_screenshots", True))
+        data["webhook_screenshot_on_popup_stuck"] = bool(data.get("webhook_screenshot_on_popup_stuck", True))
+        data["webhook_screenshot_on_macro_stop"] = bool(data.get("webhook_screenshot_on_macro_stop", True))
+        return data
+
+    def _strip_webhook_settings(self, settings: dict | None) -> dict:
+        data = dict(settings or {})
+        for key in WEBHOOK_SETTING_KEYS:
+            data.pop(key, None)
+        return data
+
+    def _load_local_webhook_settings(self) -> dict:
+        path = self._webhook_settings_file()
+        if not path.exists():
+            return default_webhook_settings()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("Local webhook settings must contain a JSON object.")
+            return self._extract_webhook_settings(raw)
+        except Exception as e:
+            self._bot_log(f"Local webhook settings ignored after load failure: {e}")
+            return default_webhook_settings()
+
+    def _save_local_webhook_settings(self, settings: dict | None):
+        path = self._webhook_settings_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self._extract_webhook_settings(settings), indent=2), encoding="utf-8")
+
+    def _merge_local_webhook_settings(self, settings: dict, webhook_settings: dict | None = None) -> dict:
+        data = dict(settings or {})
+        data.update(self._extract_webhook_settings(webhook_settings if webhook_settings is not None else self._load_local_webhook_settings()))
+        return self.normalize_settings(data)
+
     def migrate_legacy_settings(self, raw: dict) -> dict:
         migrated = default_settings()
         for key in SAFE_LEGACY_MIGRATION_KEYS:
@@ -460,7 +535,8 @@ class BotController(QObject):
         return format_point(fallback)
 
     def apply_settings(self, settings: dict, save: bool = True, announce: bool = True):
-        data = self.normalize_settings(settings)
+        webhook_source = settings if any(key in (settings or {}) for key in WEBHOOK_SETTING_KEYS) else None
+        data = self._merge_local_webhook_settings(self.normalize_settings(settings), webhook_source)
         real_rules = sanitize_rules(data["real_rules"])
         enabled_specs = set()
         enabled = data.get("enabled_specs") or {}
@@ -1113,8 +1189,9 @@ class BotController(QObject):
     def save_settings(self):
         try:
             self.settings = self.normalize_settings(self.settings)
+            self._save_local_webhook_settings(self.settings)
             SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2), encoding="utf-8")
+            SETTINGS_FILE.write_text(json.dumps(self._strip_webhook_settings(self.settings), indent=2), encoding="utf-8")
         except Exception as e:
             self._bot_log(f"Could not save settings: {e}")
 
@@ -1123,7 +1200,7 @@ class BotController(QObject):
         if not settings_source.exists() and LEGACY_SETTINGS_FILE.exists():
             settings_source = LEGACY_SETTINGS_FILE
         if not settings_source.exists():
-            self.settings = self.normalize_settings(default_settings())
+            self.settings = self._merge_local_webhook_settings(default_settings())
             self.save_settings()
             self._bot_log("Settings file missing. Fresh default settings created.")
             return
@@ -1135,7 +1212,8 @@ class BotController(QObject):
             old_version = str(raw.get("settings_version", "")).strip()
             if old_version != CURRENT_SETTINGS_VERSION:
                 backup = self._backup_settings_file("legacy", source_path=settings_source)
-                self.settings = self.migrate_legacy_settings(raw)
+                webhook_source = raw if any(key in raw for key in WEBHOOK_SETTING_KEYS) and not self._webhook_settings_file().exists() else None
+                self.settings = self._merge_local_webhook_settings(self.migrate_legacy_settings(raw), webhook_source)
                 self.save_settings()
                 source = old_version or "missing"
                 self._bot_log(f"Settings migrated from version {source} to {CURRENT_SETTINGS_VERSION}.")
@@ -1145,17 +1223,22 @@ class BotController(QObject):
                 return
 
             had_removed_keys = any(key in raw for key in REMOVED_SETTINGS_KEYS)
-            self.settings = self.normalize_settings(raw)
-            if had_removed_keys:
+            had_webhook_keys = any(key in raw for key in WEBHOOK_SETTING_KEYS)
+            webhook_source = raw if had_webhook_keys and not self._webhook_settings_file().exists() else None
+            self.settings = self._merge_local_webhook_settings(self.normalize_settings(raw), webhook_source)
+            if had_removed_keys or had_webhook_keys:
                 self.save_settings()
-                self._bot_log("Removed obsolete settings keys from current settings.")
+                if had_removed_keys:
+                    self._bot_log("Removed obsolete settings keys from current settings.")
+                if had_webhook_keys:
+                    self._bot_log("Migrated Discord webhook settings to local-only storage.")
             self._bot_log(f"Settings loaded successfully. Source: {settings_source}")
             if settings_source != SETTINGS_FILE:
                 self.save_settings()
                 self._bot_log(f"Settings migrated to preferred config path: {SETTINGS_FILE}")
         except Exception as e:
             backup = self._backup_settings_file("invalid", source_path=settings_source)
-            self.settings = self.normalize_settings(default_settings())
+            self.settings = self._merge_local_webhook_settings(default_settings())
             self.save_settings()
             self._bot_log(f"Settings reset to defaults after load failure: {e}")
             if backup:
@@ -1179,7 +1262,14 @@ class BotController(QObject):
         backup = CONFIG_BACKUP_DIR / f"{SETTINGS_FILE.stem}.{reason}_backup_{timestamp}{SETTINGS_FILE.suffix}"
         try:
             backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, backup)
+            try:
+                raw = json.loads(source.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    backup.write_text(json.dumps(self._strip_webhook_settings(raw), indent=2), encoding="utf-8")
+                else:
+                    shutil.copy2(source, backup)
+            except Exception:
+                shutil.copy2(source, backup)
             return backup
         except Exception as e:
             self._bot_log(f"Could not back up settings file: {e}")

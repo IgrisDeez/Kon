@@ -1,6 +1,6 @@
 """Single source of truth for Kon. branding and version metadata."""
 
-APP_VERSION = "v1.100.20"
+APP_VERSION = "v1.100.23"
 APP_BRAND_NAME = "Kon."
 APP_BASE_NAME = "Kon"
 APP_CONSOLE_LABEL = "K. Console"

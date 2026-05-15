@@ -36,6 +36,28 @@ class StubBot(AelrithForgeBot):
         return self._candidates
 
 
+class FastLoopCandidateBot(AelrithForgeBot):
+    def __init__(self, fast_candidates, primary_candidates=None, fallback_candidates=None, signature="sig"):
+        self.messages = []
+        super().__init__(self.messages.append, lambda *_: None)
+        self.cfg["OCR_DEBUG_FILE"] = False
+        self.cfg["CURRENT_SPEC_MARKER_OCR"] = False
+        self.fast_candidates = list(fast_candidates)
+        self.primary_candidates = list(primary_candidates or [])
+        self.fallback_candidates = list(fallback_candidates or [])
+        self.signature = signature
+        self.calls = []
+
+    def get_stats_ocr_candidates(self, *args, **kwargs):
+        self.calls.append(dict(kwargs))
+        self._last_stats_ocr_signature = self.signature
+        if kwargs.get("fallback_only"):
+            return list(self.fallback_candidates)
+        if kwargs.get("fast_loop"):
+            return list(self.fast_candidates)
+        return list(self.primary_candidates)
+
+
 class SequentialCandidateBot(AelrithForgeBot):
     def __init__(self, candidate_batches):
         self.messages = []
@@ -728,12 +750,12 @@ class BackendLogicTests(unittest.TestCase):
         clicks = []
         bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
 
-        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
-        self.assertEqual(bot.last_startup_result, "confirmed_rolling")
-        self.assertEqual([call[0][1] for call in clicks], ["Initial Auto Start"])
-        self.assertTrue(any("Auto checkbox appears off; clicking to enable" in message for message in messages))
+        self.assertFalse(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(bot.last_startup_result, "failed_no_roll_detected")
+        self.assertEqual(clicks, [])
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
         self.assertFalse(any("Manual reroll flow | initial auto start fallback" in message for message in messages))
-        self.assertTrue(any("result=confirmed_rolling" in message for message in messages))
+        self.assertTrue(any("result=failed_no_roll_detected" in message for message in messages))
 
     def test_recovery_skips_checkbox_toggle_when_auto_already_enabled(self):
         messages = []
@@ -810,12 +832,10 @@ class BackendLogicTests(unittest.TestCase):
 
         self.assertFalse(bot.start_or_recover("Initial Auto Start"))
         self.assertEqual(bot.last_startup_result, "failed_no_roll_detected")
-        self.assertEqual(len(clicks), 1)
-        self.assertEqual(clicks[0][0][1], "Initial Auto Start Guarded Startup Enable")
+        self.assertEqual(clicks, [])
         self.assertTrue(any("Startup auto state uncertain; retrying state detection" in message for message in messages))
-        self.assertTrue(any("allow one bounded startup seed click" in message for message in messages))
-        self.assertTrue(any("Startup fallback click did not confirm rolling" in message for message in messages))
-        self.assertTrue(any("startup_fallback_click=True" in message for message in messages))
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
+        self.assertTrue(any("startup_fallback_click=False" in message for message in messages))
         self.assertTrue(any("cautious_uncertain_click=False" in message for message in messages))
 
     def test_initial_auto_start_unknown_after_retry_fails_safely_when_not_confirmed(self):
@@ -840,10 +860,10 @@ class BackendLogicTests(unittest.TestCase):
 
         self.assertFalse(bot.start_or_recover("Initial Auto Start"))
         self.assertEqual(bot.last_startup_result, "failed_unreadable_ui")
-        self.assertEqual(len(clicks), 1)
+        self.assertEqual(clicks, [])
         self.assertEqual(manual_calls, [])
-        self.assertTrue(any("Startup fallback click did not confirm rolling" in message for message in messages))
-        self.assertTrue(any("startup_fallback_click=True" in message for message in messages))
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
+        self.assertTrue(any("startup_fallback_click=False" in message for message in messages))
         self.assertFalse(any("Restore Auto" in str(call) for call in clicks))
 
 
@@ -869,12 +889,8 @@ class BackendLogicTests(unittest.TestCase):
         self.assertFalse(bot.start_or_recover("Initial Auto Start"))
         self.assertFalse(bot.start_or_recover("Initial Auto Start"))
         self.assertEqual(bot.last_startup_result, "failed_unreadable_ui")
-        self.assertEqual(len(clicks), 2)
-        self.assertEqual(
-            [call[0][1] for call in clicks],
-            ["Initial Auto Start Guarded Startup Enable", "Initial Auto Start Guarded Startup Enable"],
-        )
-        self.assertEqual(sum("allow one bounded startup seed click" in message for message in messages), 2)
+        self.assertEqual(clicks, [])
+        self.assertEqual(sum("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages), 4)
         self.assertFalse(any("Restore Auto" in str(call) for call in clicks))
 
     def test_initial_auto_start_auto_resume_unknown_state_stays_conservative(self):
@@ -1314,6 +1330,22 @@ class BackendLogicTests(unittest.TestCase):
         self.assertTrue(bot.manual_reroll_flow("unit bad mythical"))
         self.assertEqual([call[0][1] for call in clicks], ["Manual Reroll", "Confirm Popup"])
         self.assertFalse(any("popup absence confirmed; skipping fallback Yes" in message for message in messages))
+
+    def test_manual_reroll_popup_cleared_resume_verify_uses_single_fast_psm6_poll(self):
+        bot = self.make_bot()
+        transition = bot._manual_reroll_timing_profile(False)
+
+        profile = bot._stats_verify_profile(
+            "manual_reroll_resume_verify",
+            transition_profile=transition,
+            popup_known_false=True,
+        )
+
+        self.assertEqual(profile["polls_override"], 1)
+        self.assertEqual(profile["psm_sequence_override"], (6,))
+        self.assertEqual(profile["unreadable_fast_fail_polls"], 1)
+        self.assertFalse(profile["post_popup_check_enabled"])
+        self.assertFalse(profile["mid_popup_check_enabled"])
 
     def test_manual_reroll_popup_psm6_fallback_detects_confirm_dialog(self):
         messages = []
@@ -1992,7 +2024,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertTrue(any("auto_state=enabled_no_click" in message for message in messages))
         self.assertEqual(clicks, [])
 
-    def test_powers_startup_compact_non_target_preflight_disabled_clicks_once_then_verifies(self):
+    def test_powers_startup_compact_non_target_preflight_disabled_blocks_auto_click(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
         bot.set_roll_domain("powers")
@@ -2026,10 +2058,9 @@ class BackendLogicTests(unittest.TestCase):
 
         bot.stats_changed = fake_stats_changed
 
-        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
-        self.assertEqual(len(clicks), 1)
-        self.assertEqual(clicks[0][0][1], "Initial Auto Start Compact Startup Enable")
-        self.assertTrue(any("auto_state=disabled_clicked" in message for message in messages))
+        self.assertFalse(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(clicks, [])
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
         self.assertFalse(any("startup_powers_observe_without_toggle" in message for message in messages))
 
     def test_powers_startup_compact_enabled_no_click_skips_double_check_after_decisive_nonconfirming_primary(self):
@@ -2076,8 +2107,9 @@ class BackendLogicTests(unittest.TestCase):
 
         self.assertFalse(bot.start_or_recover("Initial Auto Start"))
         self.assertEqual([call[0] for call in stats_calls], ["Initial Auto Start preflight rolling check", "Initial Auto Start auto verify"])
-        self.assertEqual(manual_calls, ["initial auto start enabled checkbox fallback"])
+        self.assertEqual(manual_calls, [])
         self.assertTrue(any("double_check_skipped=True" in message for message in messages))
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
 
     def test_startup_guarded_recovery_decisive_nonconfirming_skips_double_check(self):
         messages = []
@@ -2128,11 +2160,10 @@ class BackendLogicTests(unittest.TestCase):
         self.assertFalse(bot.start_or_recover("Initial Auto Start"))
         self.assertEqual(
             [call[0] for call in stats_calls],
-            ["Initial Auto Start preflight rolling check", "Initial Auto Start auto verify", "Initial Auto Start guarded startup verify"],
+            ["Initial Auto Start preflight rolling check", "Initial Auto Start auto verify"],
         )
-        self.assertEqual(len(clicks), 1)
-        self.assertEqual(clicks[0][0][1], "Initial Auto Start Guarded Startup Enable")
-        self.assertTrue(any("double_check_skipped=True | reason=guarded_recovery_decisive_nonconfirming" in message for message in messages))
+        self.assertEqual(clicks, [])
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
 
     def test_specs_safe_filler_unknown_auto_with_weak_refresh_fails_without_fake_confirm(self):
         messages = []
@@ -2230,7 +2261,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertTrue(any("spec_safe_filler_unproven_auto_state_fail_safe" in message for message in messages))
         self.assertTrue(any("manual reroll blocked for safe filler because current roll was not BAD/DISABLED" in message for message in messages))
 
-    def test_specs_safe_filler_disabled_auto_clicks_once_and_does_not_manual_reroll(self):
+    def test_specs_safe_filler_disabled_auto_blocks_startup_click_and_does_not_manual_reroll(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
         bot.set_roll_domain("specs")
@@ -2272,12 +2303,11 @@ class BackendLogicTests(unittest.TestCase):
 
         bot.stats_changed = fake_stats_changed
 
-        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
-        self.assertEqual(stats_calls, ["Initial Auto Start preflight rolling check", "Initial Auto Start auto verify"])
-        self.assertEqual(len(clicks), 1)
-        self.assertEqual(clicks[0][0][1], "Initial Auto Start")
+        self.assertFalse(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(stats_calls, ["Initial Auto Start preflight rolling check"])
+        self.assertEqual(clicks, [])
         self.assertEqual(manual_calls, [])
-        self.assertTrue(any("auto_state=disabled" in message and "decision=enable_auto_once" in message for message in messages))
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
 
     def test_specs_startup_weak_marker_change_does_not_manual_reroll_without_bad_or_popup(self):
         messages = []
@@ -2395,13 +2425,12 @@ class BackendLogicTests(unittest.TestCase):
         bot.stats_changed = fake_stats_changed
 
         self.assertFalse(bot.start_or_recover("Initial Auto Start"))
-        self.assertEqual(len(clicks), 1)
-        self.assertEqual(clicks[0][0][1], "Initial Auto Start Guarded Startup Enable")
+        self.assertEqual(clicks, [])
         self.assertEqual(manual_calls, [])
-        self.assertTrue(any("Startup fallback click did not confirm rolling" in message for message in messages))
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
         self.assertFalse(any("spec_safe_filler_auto_resume_unresolved_manual_fallback" in message for message in messages))
 
-    def test_powers_startup_compact_non_target_preflight_unknown_uses_bounded_guarded_recovery(self):
+    def test_powers_startup_compact_non_target_preflight_unknown_blocks_bounded_recovery_click(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
         bot.set_roll_domain("powers")
@@ -2428,15 +2457,13 @@ class BackendLogicTests(unittest.TestCase):
         bot.stats_changed = fake_stats_changed
         bot._attempt_auto_reenable_once = lambda *args, **kwargs: bounded_calls.append((args, kwargs)) or True
 
-        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
+        self.assertFalse(bot.start_or_recover("Initial Auto Start"))
         self.assertEqual(clicks, [])
-        self.assertEqual(len(bounded_calls), 1)
-        self.assertIn("Compact Startup Recovery", bounded_calls[0][0][0])
-        self.assertTrue(bounded_calls[0][1]["force_click_on_ambiguous"])
-        self.assertTrue(any("auto_state=unknown_guarded_path" in message for message in messages))
+        self.assertEqual(bounded_calls, [])
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
         self.assertFalse(any("startup_powers_observe_without_toggle" in message for message in messages))
 
-    def test_powers_startup_compact_disabled_click_does_not_repeat_same_click_when_final_state_stays_disabled(self):
+    def test_powers_startup_compact_disabled_blocks_initial_click(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
         bot.set_roll_domain("powers")
@@ -2486,9 +2513,8 @@ class BackendLogicTests(unittest.TestCase):
         bot.stats_changed = fake_stats_changed
 
         self.assertFalse(bot.start_or_recover("Initial Auto Start"))
-        self.assertEqual(len(clicks), 1)
-        self.assertEqual(clicks[0][0][1], "Initial Auto Start Compact Startup Enable")
-        self.assertTrue(any("compact startup enable click still ended with Auto disabled" in message for message in messages))
+        self.assertEqual(clicks, [])
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
 
     def test_startup_defers_force_shard_priming_until_first_loop_iteration(self):
         messages = []
@@ -3587,21 +3613,23 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(dedup_keys, ["near_miss:rampage:Crit Damage: 2.1 below min"])
         content, kwargs = sent[0]
         self.assertFalse(kwargs["use_ping"])
-        self.assertTrue(content.startswith("# Kon. Near Miss"))
-        self.assertIn("━━━━━━━━━━━━━━━━━━━━━━━", content)
-        self.assertIn("Rampage was close, but skipped.", content)
-        self.assertIn("```", content)
-        self.assertTrue(content.rstrip().endswith("```"))
-        self.assertIn("Stat Result", content)
-        self.assertIn("Combo Ramp      29.1", content)
-        self.assertIn("Damage          29.2", content)
-        self.assertIn("Crit Rate        3.2", content)
-        self.assertIn("Crit Damage      6.9", content)
-        self.assertIn("Missed:\nCrit Damage", content)
-        self.assertIn("Rolled: 6.9", content)
-        self.assertIn("Needed: 9–10", content)
-        self.assertIn("Gap: -2.1", content)
-        self.assertIn("Session:\nUptime: 9m 21s\nTime:", content)
+        self.assertTrue(content.startswith("# Kon. Near Miss - Spec"))
+        self.assertIn("## What happened", content)
+        self.assertIn("Rampage was close to the configured target", content)
+        self.assertIn("## Roll", content)
+        self.assertIn("- Type: Spec", content)
+        self.assertIn("- Trait: Rampage", content)
+        self.assertIn("- Combo Ramp: 29.1", content)
+        self.assertIn("- Damage: 29.2", content)
+        self.assertIn("- Crit Rate: 3.2", content)
+        self.assertIn("- Crit Damage: 6.9", content)
+        self.assertIn("## Target check", content)
+        self.assertIn("- Missed stat: Crit Damage", content)
+        self.assertIn("- Rolled: 6.9", content)
+        self.assertIn("- Needed: 9-10", content)
+        self.assertIn("- Gap: -2.1", content)
+        self.assertIn("## Session\n- Uptime: 9m 21s\n- Time:", content)
+        self.assertIn("## OCR", content)
         self.assertNotIn("Near Miss Found", content)
         self.assertTrue(any("format=v2_clean_markdown" in message for message in messages))
 
@@ -3653,17 +3681,68 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(dedup_keys, ["near_miss:subjugator:Luck: 7.6 below min"])
         content, kwargs = sent[0]
         self.assertFalse(kwargs["use_ping"])
-        self.assertTrue(content.startswith("# Kon. Near Miss"))
-        self.assertIn("Subjugator was close, but skipped.", content)
-        self.assertIn("Passive NPC Slow 20 5s", content)
-        self.assertIn("Damage            36.8", content)
-        self.assertIn("HP                34.4", content)
-        self.assertIn("Missed:\nLuck", content)
-        self.assertIn("Rolled: 9.4", content)
-        self.assertIn("Needed: 17–17.5", content)
-        self.assertIn("Gap: -7.6", content)
-        self.assertIn("Session:\nUptime: 2m 3s\nTime:", content)
-        self.assertTrue(content.rstrip().endswith("```"))
+        self.assertTrue(content.startswith("# Kon. Near Miss - Power"))
+        self.assertIn("Subjugator was close to the configured target", content)
+        self.assertIn("- Type: Power", content)
+        self.assertIn("- Power: Subjugator", content)
+        self.assertIn("- Passive NPC Slow: 20 5s", content)
+        self.assertIn("- Damage: 36.8", content)
+        self.assertIn("- HP: 34.4", content)
+        self.assertIn("- Missed stat: Luck", content)
+        self.assertIn("- Rolled: 9.4", content)
+        self.assertIn("- Needed: 17-17.5", content)
+        self.assertIn("- Gap: -7.6", content)
+        self.assertIn("## Session\n- Uptime: 2m 3s\n- Time:", content)
+        self.assertIn("## OCR", content)
+
+    def test_god_roll_discord_alert_uses_clear_spec_layout(self):
+        bot = self.make_bot()
+        bot._format_uptime = lambda: "4m 5s"
+        sent = []
+        bot._send_discord_file = lambda *args, **kwargs: sent.append((args, kwargs)) or True
+
+        ok = bot.send_webhook(
+            "shot.png",
+            "rampage",
+            "Combo Ramp 30 | Damage 30 | Crit Rate 3.5 | Crit Damage 10",
+            "current spec rampage combo ramp 30 damage 30",
+        )
+
+        self.assertTrue(ok)
+        content = sent[0][0][0]
+        self.assertTrue(content.startswith("# Kon. Kept Spec Roll"))
+        self.assertIn("## What happened", content)
+        self.assertIn("matched the active target rules", content)
+        self.assertIn("- Type: Spec", content)
+        self.assertIn("- Trait: Rampage", content)
+        self.assertIn("- Combo Ramp: 30", content)
+        self.assertIn("- Status: Kept", content)
+        self.assertIn("## Session\n- Uptime: 4m 5s\n- Time:", content)
+        self.assertIn("## OCR", content)
+
+    def test_god_roll_discord_alert_uses_clear_power_layout(self):
+        bot = self.make_bot()
+        bot.set_roll_domain("powers")
+        bot._format_uptime = lambda: "7m 8s"
+        sent = []
+        bot._send_discord_file = lambda *args, **kwargs: sent.append((args, kwargs)) or True
+
+        ok = bot.send_webhook(
+            "shot.png",
+            "subjugator",
+            "Passive NPC Slow 20 5s | Damage 41 | Crit Chance 3 | Luck 17.2 | Crit Damage 14",
+            "subjugator npc slow damage luck",
+        )
+
+        self.assertTrue(ok)
+        content = sent[0][0][0]
+        self.assertTrue(content.startswith("# Kon. Kept Power Roll"))
+        self.assertIn("- Type: Power", content)
+        self.assertIn("- Power: Subjugator", content)
+        self.assertIn("- Passive NPC Slow: 20 5s", content)
+        self.assertIn("- Status: Kept", content)
+        self.assertIn("all configured Power target thresholds were met", content)
+        self.assertIn("## Session\n- Uptime: 7m 8s\n- Time:", content)
 
     def test_check_roll_marks_rampage_god_roll_with_combo_ramp(self):
         bot = StubBot(
@@ -3716,6 +3795,106 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(missing, ["Unsupported trait autoskip"])
         self.assertFalse(near)
         self.assertTrue(any("unsupported_trait_autoskip" in message for message in bot.messages))
+
+    def test_specs_fast_loop_complete_supported_trait_skips_fallback(self):
+        bot = FastLoopCandidateBot(
+            [
+                (
+                    "tesseract-full-original-psm6",
+                    "current spec executioner npc dmg 44.8 crit chance 3.5 crit damage 14.2",
+                    "CURRENT SPEC Executioner NPC DMG 44.8 Crit Chance 3.5 Crit Damage 14.2",
+                )
+            ]
+        )
+
+        state, trait, summary, _text, missing, near = bot.check_roll()
+
+        self.assertEqual(state, "GOD")
+        self.assertEqual(trait, "executioner")
+        self.assertIn("NPC DMG 44.8", summary)
+        self.assertEqual(missing, [])
+        self.assertFalse(near)
+        self.assertEqual(len(bot.calls), 1)
+        self.assertTrue(bot.calls[0].get("fast_loop"))
+        self.assertFalse(any(call.get("fallback_only") for call in bot.calls))
+
+    def test_specs_fast_loop_unsupported_trait_skips_fallback(self):
+        bot = FastLoopCandidateBot(
+            [
+                (
+                    "tesseract-full-original-psm6",
+                    "current spec berserker damage 24.6 crit damage 14.8",
+                    "CURRENT SPEC Berserker Damage 24.6 Crit Damage 14.8",
+                )
+            ]
+        )
+
+        state, trait, summary, _text, missing, near = bot.check_roll()
+
+        self.assertEqual(state, "NON_TARGET")
+        self.assertEqual(trait, "non_target")
+        self.assertIn("berserker", summary)
+        self.assertEqual(missing, ["Unsupported trait autoskip"])
+        self.assertFalse(near)
+        self.assertEqual(len(bot.calls), 1)
+        self.assertTrue(bot.calls[0].get("fast_loop"))
+
+    def test_specs_fast_loop_partial_supported_trait_escalates_to_primary(self):
+        bot = FastLoopCandidateBot(
+            [
+                (
+                    "tesseract-full-original-psm6",
+                    "current spec executioner npc dmg 44.8",
+                    "CURRENT SPEC Executioner NPC DMG 44.8",
+                )
+            ],
+            primary_candidates=[
+                (
+                    "tesseract-full-original-psm6",
+                    "current spec executioner npc dmg 44.8 crit chance 3.5 crit damage 14.2",
+                    "CURRENT SPEC Executioner NPC DMG 44.8 Crit Chance 3.5 Crit Damage 14.2",
+                )
+            ],
+        )
+
+        state, trait, summary, _text, missing, near = bot.check_roll()
+
+        self.assertEqual(state, "GOD")
+        self.assertEqual(trait, "executioner")
+        self.assertIn("Crit Damage 14.2", summary)
+        self.assertEqual(missing, [])
+        self.assertFalse(near)
+        self.assertEqual(len(bot.calls), 2)
+        self.assertTrue(bot.calls[0].get("fast_loop"))
+        self.assertFalse(bot.calls[1].get("fast_loop", False))
+        self.assertFalse(bot.calls[1].get("fallback_only", False))
+
+    def test_specs_fast_loop_caches_repeated_non_target_without_fallback(self):
+        bot = FastLoopCandidateBot(
+            [
+                (
+                    "tesseract-full-original-psm6",
+                    "current spec frostborn damage 24.6 crit damage 14.8",
+                    "CURRENT SPEC Frostborn Damage 24.6 Crit Damage 14.8",
+                )
+            ],
+            primary_candidates=[
+                (
+                    "tesseract-full-original-psm6",
+                    "current spec executioner npc dmg 44.8 crit chance 3.5 crit damage 14.2",
+                    "CURRENT SPEC Executioner NPC DMG 44.8 Crit Chance 3.5 Crit Damage 14.2",
+                )
+            ],
+        )
+
+        first = bot.check_roll()
+        second = bot.check_roll()
+
+        self.assertEqual(first[0], "NON_TARGET")
+        self.assertEqual(second[0], "NON_TARGET")
+        self.assertEqual([call.get("fast_loop", False) for call in bot.calls], [True, True])
+        self.assertFalse(any(call.get("fallback_only") for call in bot.calls))
+        self.assertTrue(any("cached_non_target" in message for message in bot.messages))
 
     def test_generic_current_spec_non_target_is_rollable_without_target_thresholds(self):
         bot = StubBot(
@@ -3846,8 +4025,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertIn("Crit Damage 7.5", summary)
         self.assertFalse(any("Crit Damage: not found" in item for item in missing))
         self.assertGreaterEqual(bot.candidate_calls, 2)
-        self.assertTrue(any("Partial target mythical candidate detected" in message for message in bot.messages))
-        self.assertTrue(any("Partial target mythical stabilized" in message for message in bot.messages))
+        self.assertTrue(any("Specs OCR fast-loop promoted to primary route" in message for message in bot.messages))
 
     def test_startup_fast_check_uses_partial_target_confirm_window(self):
         bot = SequentialCandidateBot(
@@ -4009,12 +4187,18 @@ class BackendLogicTests(unittest.TestCase):
 
             self.assertEqual(controller.settings["settings_version"], CURRENT_SETTINGS_VERSION)
             self.assertEqual(saved["settings_version"], CURRENT_SETTINGS_VERSION)
-            self.assertEqual(saved["webhook_url"], "https://discord.example/hook")
-            self.assertEqual(saved["player_ping"], "@player")
+            self.assertNotIn("webhook_url", saved)
+            self.assertNotIn("player_ping", saved)
+            local_webhook = json.loads(controller._webhook_settings_file().read_text(encoding="utf-8"))
+            self.assertEqual(local_webhook["webhook_url"], "https://discord.example/hook")
+            self.assertEqual(local_webhook["player_ping"], "@player")
             self.assertEqual(saved["coords"]["auto"], "11,22")
             self.assertEqual(saved["stats_region"], default_settings()["stats_region"])
             self.assertNotIn("use_easyocr", saved)
             self.assertTrue(backups)
+            backup_payload = json.loads(backups[0].read_text(encoding="utf-8"))
+            self.assertNotIn("webhook_url", backup_payload)
+            self.assertNotIn("player_ping", backup_payload)
 
     def test_malformed_settings_are_backed_up_and_reset_to_defaults(self):
         with TemporaryDirectory() as temp_dir, controller_storage(temp_dir) as settings_path:
@@ -4025,8 +4209,8 @@ class BackendLogicTests(unittest.TestCase):
             saved = json.loads(settings_path.read_text(encoding="utf-8"))
             backups = list((Path(temp_dir) / "config" / "backups").glob("aelrith_forge_settings.invalid_backup_*.json"))
 
-            self.assertEqual(json.loads(json.dumps(controller.settings)), saved)
-            self.assertEqual(saved, self.saved_default_settings())
+            self.assertEqual(json.loads(json.dumps(controller._strip_webhook_settings(controller.settings))), saved)
+            self.assertEqual(saved, controller._strip_webhook_settings(self.saved_default_settings()))
             self.assertTrue(backups)
 
     def test_controller_loads_full_power_shard_settings_from_saved_config(self):
@@ -4091,7 +4275,47 @@ class BackendLogicTests(unittest.TestCase):
 
             self.assertIsNotNone(backup)
             self.assertTrue(Path(backup).exists())
-            self.assertEqual(saved, json.loads(json.dumps(controller.settings)))
+            self.assertEqual(saved, json.loads(json.dumps(controller._strip_webhook_settings(controller.settings))))
+
+    def test_local_webhook_settings_load_apply_and_test_webhook(self):
+        with TemporaryDirectory() as temp_dir, controller_storage(temp_dir) as settings_path:
+            settings_path.write_text(
+                json.dumps(controller_module.BotController.__new__(BotController).normalize_settings(default_settings()), indent=2),
+                encoding="utf-8",
+            )
+            local_path = settings_path.parent / controller_module.WEBHOOK_SETTINGS_FILE_NAME
+            local_path.write_text(
+                json.dumps(
+                    {
+                        "webhook_url": "https://discord.example/local",
+                        "player_ping": "@local",
+                        "webhook_live_status_enabled": False,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            controller = BotController()
+            self.assertEqual(controller.settings["webhook_url"], "https://discord.example/local")
+            self.assertEqual(controller.settings["player_ping"], "@local")
+            self.assertFalse(controller.settings["webhook_live_status_enabled"])
+            self.assertEqual(controller.bot.cfg["WEBHOOK_URL"], "https://discord.example/local")
+
+            calls = []
+            controller.bot.test_webhook = lambda: calls.append(controller.bot.cfg["WEBHOOK_URL"]) or True
+            updated = dict(controller.settings)
+            updated["webhook_url"] = "https://discord.example/updated"
+            updated["player_ping"] = "@updated"
+
+            self.assertTrue(controller.test_webhook(updated))
+            self.assertEqual(calls, ["https://discord.example/updated"])
+            normal_saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            local_saved = json.loads(local_path.read_text(encoding="utf-8"))
+            self.assertNotIn("webhook_url", normal_saved)
+            self.assertNotIn("player_ping", normal_saved)
+            self.assertEqual(local_saved["webhook_url"], "https://discord.example/updated")
+            self.assertEqual(local_saved["player_ping"], "@updated")
 
     def test_safe_power_settings_backup_excludes_secrets_and_preserves_power_layout(self):
         with TemporaryDirectory() as temp_dir, controller_storage(temp_dir):
@@ -4416,7 +4640,7 @@ class BackendLogicTests(unittest.TestCase):
         self.assertEqual(len(remaining), 2)
         self.assertEqual(remaining, ["old_2", "old_3"])
 
-    def test_startup_manual_fallback_skips_duplicate_verify_after_recent_manual_confirmation(self):
+    def test_startup_manual_fallback_blocks_without_bad_roll_or_popup(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
         bot.set_roll_domain("powers")
@@ -4431,14 +4655,16 @@ class BackendLogicTests(unittest.TestCase):
         bot._auto_checkbox_enabled_is_weak = lambda: False
         bot._auto_checkbox_confidence_tier = lambda: "strong_enabled"
         bot._startup_context = {"current_spec_class": "unknown", "preflight_fallback_reason": "none"}
-        bot.manual_reroll_flow = lambda *_args, **_kwargs: setattr(bot, "last_manual_reroll_confirmed_at", time.perf_counter()) or True
+        manual_calls = []
+        bot.manual_reroll_flow = lambda *args, **_kwargs: manual_calls.append(args) or True
         bot.stats_changed = lambda baseline, context="", **_kwargs: (_ for _ in ()).throw(
             AssertionError(f"unexpected duplicate verify: {context}")
         ) if "manual fallback verify" in context else (False, baseline)
 
-        self.assertTrue(bot.start_or_recover("Initial Auto Start"))
-        self.assertEqual(bot.last_startup_result, "confirmed_rolling")
-        self.assertTrue(any("manual fallback verify skipped" in message for message in messages))
+        self.assertFalse(bot.start_or_recover("Initial Auto Start"))
+        self.assertEqual(bot.last_startup_result, "failed_no_roll_detected")
+        self.assertEqual(manual_calls, [])
+        self.assertTrue(any("startup_auto_click_blocked_non_bad_current_roll" in message for message in messages))
 
     def test_extracts_power_shard_count(self):
         bot = self.make_bot()

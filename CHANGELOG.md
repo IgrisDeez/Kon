@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.100.23
+
+- Moved Discord webhook URL, ping, and delivery preferences into local-only webhook settings storage.
+- Redacted webhook secrets from normal settings saves and settings backups while preserving UI/Test Webhook behavior.
+- Reworked Specs and Powers God/Near Miss Discord roll alerts into clearer Markdown sections.
+
+## v1.100.22
+
+- Blocked generic startup Auto checkbox clicks when no BAD/DISABLED listed Mythical or confirmed reroll popup is detected.
+- Kept BAD/DISABLED startup manual reroll and bounded manual-reroll Auto resume behavior intact.
+- Added regressions for disabled/unknown startup checkbox reads so non-BAD startup rolls fail safe instead of risking an Auto untick.
+
+## v1.100.21
+
+- Added a Specs fast-loop OCR path that evaluates complete supported Mythicals or clear unsupported/filler rolls before the full OCR fallback chain.
+- Skipped redundant fallback and partial-confirmation work for strict autoskip reads, with a short cache for repeated non-target screen signatures.
+- Shortened popup-cleared manual reroll resume verification to one fast psm6 poll while preserving stale, unreadable, and blocked-session safety checks.
+
 ## v1.100.20
 
 - Restricted Specs trait detection to the supported Mythical allowlist: Fortune Chosen, Executioner, and Rampage.

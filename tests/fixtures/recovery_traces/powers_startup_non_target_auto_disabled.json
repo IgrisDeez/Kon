@@ -41,17 +41,17 @@
     }
   ],
   "expected": {
-    "result": true,
+    "result": false,
     "snapshot_type": "startup",
     "snapshot": {
-      "result": "confirmed_rolling",
-      "route": "none",
-      "route_reason": "none",
-      "auto_state": "disabled_clicked",
-      "rolling_confirmed": true,
-      "failure_type": "none",
-      "support_signals": []
+      "result": "failed_no_roll_detected",
+      "route": "fail_safe",
+      "route_reason": "startup_auto_click_blocked_non_bad_current_roll",
+      "auto_state": "disabled",
+      "rolling_confirmed": false,
+      "failure_type": "non_bad_startup_auto_click_blocked",
+      "support_signals": ["compact_preflight", "non_bad_current_roll", "spec_class:NON_TARGET filler"]
     },
-    "click_labels": ["Initial Auto Start Compact Startup Enable"]
+    "click_labels": []
   }
 }
