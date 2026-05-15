@@ -4680,6 +4680,70 @@ class BackendLogicTests(unittest.TestCase):
         value, normalized = parse_power_shard_count("201K Power Shards")
         self.assertEqual(normalized, "201k")
         self.assertEqual(value, 201000)
+        value, normalized = parse_power_shard_count("1.37MPowerShards", previous_value=20100, infer_missing_suffix=True)
+        self.assertEqual(normalized, "1.37m")
+        self.assertEqual(value, 1370000)
+        value, normalized = parse_power_shard_count("1,000,0001", previous_value=1370000, infer_missing_suffix=True)
+        self.assertEqual(normalized, "10000001")
+        self.assertIsNone(value)
+
+    def test_power_shard_read_accepts_compact_millions_with_previous_low_value(self):
+        attempts = []
+        for mode in ("raw", "gray", "contrast", "threshold"):
+            for psm in (7, 6):
+                parsed, normalized, candidate_type = bot_module._parse_power_shard_count_detail(
+                    "1.37MPowerShards",
+                    previous_value=20100,
+                    infer_missing_suffix=True,
+                )
+                attempts.append(
+                    {
+                        "mode": mode,
+                        "psm": psm,
+                        "raw": "1.37MPowerShards",
+                        "normalized": normalized,
+                        "parsed": parsed,
+                        "formatted": bot_module.format_shard_count(parsed) if parsed is not None else "not found",
+                        "reason": "parsed" if parsed is not None else "no valid shard count",
+                        "candidate_type": candidate_type,
+                    }
+                )
+        bot = PowerShardStubBot(attempts)
+        bot.last_power_shards = 20100
+
+        self.assertEqual(bot.read_power_shards(), 1370000)
+        self.assertEqual(bot.last_power_shards, 1370000)
+        self.assertTrue(any("Power shard OCR accepted" in message and "1.37M" in message for message in bot.messages))
+
+    def test_power_shard_read_rejects_malformed_plain_million_count(self):
+        attempts = []
+        for mode in ("raw", "gray", "contrast", "threshold"):
+            for psm in (7, 6):
+                parsed, normalized, candidate_type = bot_module._parse_power_shard_count_detail(
+                    "1,000,0001",
+                    previous_value=1370000,
+                    infer_missing_suffix=True,
+                )
+                attempts.append(
+                    {
+                        "mode": mode,
+                        "psm": psm,
+                        "raw": "1,000,0001",
+                        "normalized": normalized,
+                        "parsed": parsed,
+                        "formatted": bot_module.format_shard_count(parsed) if parsed is not None else "not found",
+                        "reason": "rejected malformed plain shard count"
+                        if candidate_type == "malformed_plain_count"
+                        else "no valid shard count",
+                        "candidate_type": candidate_type,
+                    }
+                )
+        bot = PowerShardStubBot(attempts)
+        bot.last_power_shards = 1370000
+
+        self.assertIsNone(bot.read_power_shards())
+        self.assertEqual(bot.last_power_shards, 1370000)
+        self.assertTrue(any("rejected malformed plain shard count" in message for message in bot.messages))
 
     def test_power_shard_reporting_and_empty_confirmation(self):
         bot = PowerShardStubBot(

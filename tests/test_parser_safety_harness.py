@@ -178,6 +178,8 @@ def test_parse_passive_shard_previous_value_guard_keeps_high_value():
         ("Power Shards: 71k", 71000, "71k"),
         ("Power Shards: 71,0k", 71000, "71.0k"),
         ("Power Shards: 71000", 71000, "71000"),
+        ("1.3MPowerShards", 1300000, "1.3m"),
+        ("1,37M Power Shards", 1370000, "1.37m"),
     ],
 )
 def test_parse_power_shard_count_variants(raw, expected, expected_normalized):
@@ -185,6 +187,20 @@ def test_parse_power_shard_count_variants(raw, expected, expected_normalized):
 
     assert value == expected
     assert normalized == expected_normalized
+
+
+def test_parse_power_shard_suffix_beats_previous_value_guard():
+    value, normalized = parse_power_shard_count("1.37MPowerShards", previous_value=20100, infer_missing_suffix=True)
+
+    assert value == 1370000
+    assert normalized == "1.37m"
+
+
+def test_parse_power_shard_rejects_malformed_plain_count_with_previous_value():
+    value, normalized = parse_power_shard_count("1,000,0001", previous_value=1370000, infer_missing_suffix=True)
+
+    assert value is None
+    assert normalized == "10000001"
 
 
 @pytest.mark.parametrize(

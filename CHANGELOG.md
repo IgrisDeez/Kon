@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.100.25
+
+- Fixed Power Shards OCR parsing so compact million reads like `1.37M` are accepted instead of being overridden by stale low values.
+- Rejected malformed plain comma reads like `1,000,0001` so they cannot display as an inflated `10m` shard count.
+
 ## v1.100.24
 
 - Reworked the README into a clearer user setup guide with download, source install, first-run setup, Discord webhook setup, and troubleshooting steps.

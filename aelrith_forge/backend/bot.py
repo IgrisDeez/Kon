@@ -546,7 +546,7 @@ def nearest_value(values, low, high):
 def normalize_shard_ocr_text(text: str) -> str:
     normalized = normalize_numeric_ocr_text(str(text or "").lower())
     normalized = re.sub(r"\bs(?=\d)", "5", normalized)
-    normalized = re.sub(r"(\d),(\d)(?=\s*[km])", r"\1.\2", normalized)
+    normalized = re.sub(r"\b(\d{1,2}),(\d{1,2})(?=\s*[kmb]\b)", r"\1.\2", normalized)
     normalized = normalized.replace(",", "")
     normalized = re.sub(r"\b([0-9]{1,3})(?:l|i)k\b", r"\1.1k", normalized)
     normalized = re.sub(r"\b([0-9]+(?:\.[0-9]+)?)(?:x|n)\b", r"\1k", normalized)
@@ -578,6 +578,13 @@ def compact_shard_count(count: int | None) -> str:
     return str(int(count))
 
 
+def _has_malformed_plain_shard_grouping(text: str, normalized: str) -> bool:
+    if re.search(r"\b[0-9]+(?:\.[0-9]+)?\s*[kmb]\b", normalized):
+        return False
+    raw = normalize_numeric_ocr_text(str(text or "").lower())
+    return bool(re.search(r"\b\d{1,3}(?:,\d{3})+\d+\b", raw))
+
+
 def _parse_shard_count_detail(
     text: str,
     previous_value: int | None = None,
@@ -586,8 +593,11 @@ def _parse_shard_count_detail(
     normalized = normalize_shard_ocr_text(text)
     if not normalized:
         return None, normalized, "none"
+    if _has_malformed_plain_shard_grouping(text, normalized):
+        return None, normalized, "malformed_plain_count"
 
     candidates = []
+    suffix_spans = []
     for match in re.finditer(r"\b([0-9]+(?:\.[0-9]+)?)([kmb])\b", normalized):
         value = float(match.group(1))
         suffix = match.group(2)
@@ -595,8 +605,11 @@ def _parse_shard_count_detail(
         parsed = int(round(value * multiplier))
         had_decimal = "." in match.group(1)
         candidates.append((parsed, value, multiplier, had_decimal, "suffix"))
+        suffix_spans.append(match.span(1))
 
     for match in re.finditer(r"\b([0-9]+(?:\.[0-9]+)?)\b", normalized):
+        if any(start <= match.start(1) and match.end(1) <= end for start, end in suffix_spans):
+            continue
         parsed = int(round(float(match.group(1))))
         value = float(match.group(1))
         had_decimal = "." in match.group(1)
@@ -8782,7 +8795,9 @@ class AelrithForgeBot:
                     self.last_passive_shards,
                     infer_missing_suffix=True,
                 )
-                if not normalized:
+                if candidate_type == "malformed_plain_count":
+                    reason = "rejected malformed plain shard count"
+                elif not normalized:
                     reason = "no normalized digits"
                 elif parsed is None:
                     reason = "no valid shard count"
@@ -9762,7 +9777,9 @@ class AelrithForgeBot:
                     self.last_power_shards,
                     infer_missing_suffix=True,
                 )
-                if not normalized:
+                if candidate_type == "malformed_plain_count":
+                    reason = "rejected malformed plain shard count"
+                elif not normalized:
                     reason = "no normalized digits"
                 elif parsed is None:
                     reason = "no valid shard count"
