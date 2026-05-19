@@ -449,7 +449,7 @@ class AutoEnableSafetyTests(unittest.TestCase):
         self.assertTrue(any("fast dead-screen weak-enabled path accepted" in message for message in messages))
         self.assertTrue(any("reason=weak_enabled_dead_fast_path" in message for message in messages))
 
-    def test_watchdog_ambiguous_recheck_to_weak_enabled_does_not_crash(self):
+    def test_watchdog_ambiguous_recheck_to_weak_enabled_recovers_stale_non_target(self):
         messages = []
         bot = self.make_bot(messages)
         calls = {"reads": 0}
@@ -490,13 +490,16 @@ class AutoEnableSafetyTests(unittest.TestCase):
             contexts.append(context)
             if "ambiguous checkbox confirm" in context:
                 bot.last_recovery_verify_details = {
-                    "reason": "stats_ocr_unreliable_after_ui_flow:watchdog_ambiguous_guard",
-                    "signal_sources": ["ocr", "popup", "banner", "image_change"],
+                    "reason": "weak_non_improving_dead_phase",
+                    "exit_reason": "weak_non_improving_dead_phase",
+                    "signal_sources": [],
                     "image_changed_samples": 0,
                     "max_change_score": 0.0,
+                    "weak_samples": 1,
                 }
-                bot.last_recovery_reason = "stats_ocr_unreliable_after_ui_flow:watchdog_ambiguous_guard"
-                return True, baseline
+                bot.last_recovery_verify_state = "not_rolling"
+                bot.last_recovery_reason = "weak_non_improving_dead_phase"
+                return False, baseline
             if "Unexpected No-Roll Watchdog verify" in context:
                 bot.last_recovery_verify_details = {
                     "reason": "popup_confirmed_mid_polling",
@@ -519,11 +522,16 @@ class AutoEnableSafetyTests(unittest.TestCase):
             banner_known_clear=True,
         )
 
-        self.assertEqual(result, "skipped")
+        self.assertEqual(result, "recovered")
         self.assertEqual(calls["reads"], 2)
-        self.assertEqual(clicks, [])
+        self.assertEqual(len(clicks), 1)
+        self.assertEqual(clicks[0][0][1], "Unexpected No-Roll Watchdog Auto Re-enable")
         self.assertTrue(any("ambiguous checkbox confirm" in context for context in contexts))
-        self.assertTrue(any("suppressed ambiguous checkbox click" in message for message in messages))
+        self.assertTrue(any("watchdog_non_target_stale_auto_reclick_allowed" in message for message in messages))
+        self.assertEqual(
+            bot.last_recovery_route_snapshot["support_signals"],
+            ["non_target_stale_proof", "bounded_auto_reenable"],
+        )
 
     def test_watchdog_off_panel_ambiguous_state_skips_recovery_click(self):
         messages = []

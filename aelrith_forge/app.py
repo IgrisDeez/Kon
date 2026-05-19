@@ -4,7 +4,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from . import APP_DISPLAY_NAME, APP_VERSION
+from . import APP_DISPLAY_NAME, APP_PUBLIC_VERSION
 from .backend.controller import BotController
 from .ui.main_window import MainWindow
 from .ui.theme import apply_theme
@@ -13,7 +13,7 @@ from .ui.theme import apply_theme
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_DISPLAY_NAME)
-    app.setApplicationVersion(APP_VERSION)
+    app.setApplicationVersion(APP_PUBLIC_VERSION)
     app.setOrganizationName("Kon")
     apply_theme(app)
 

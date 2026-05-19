@@ -95,7 +95,7 @@ LEGACY_SPEC_TRAIT_ALIASES = {
 TRAIT_ALIASES = {
     "fortune": ["fortune chosen", "fortunechosen", "fortune", "fortu", "urtune", "furtune", "borturne", "chosen", "chosem", "lhosen", "lhoser"],
     "executioner": ["executioner", "executione", "xecutioner", "execut", "lxecut", "edee"],
-    "rampage": ["rampage", "ranpage", "fanpage", "ra mpage", "rarnpage", "rgxaga", "rxaga", "ragaga"],
+    "rampage": ["rampage", "ranpage", "fanpage", "ra mpage", "rarnpage", "rgxaga", "rxaga", "ragaga", "aterany"],
 }
 
 ROLLABLE_NON_TARGET_TRAIT_ALIASES = {
@@ -134,6 +134,7 @@ TYPO_MAP = {
     "rgxaga": "rampage",
     "rxaga": "rampage",
     "ragaga": "rampage",
+    "aterany": "rampage",
     "danage": "damage",
     "erit": "crit",
     "erit rate": "crit rate",
@@ -164,6 +165,8 @@ TYPO_MAP = {
     "ccrit chance": "crit chance",
     "crit oance": "crit chance",
     "crit cance": "crit chance",
+    "ert chanice": "crit chance",
+    "bmcaitchance": "crit chance",
     "qit chance": "crit chance",
     "dit chance": "crit chance",
     "git damage": "crit damage",
@@ -171,6 +174,8 @@ TYPO_MAP = {
     "crit darmaee": "crit damage",
     "crit darmage": "crit damage",
     "crit danmage": "crit damage",
+    "eit dantige": "crit damage",
+    "gtdakige": "crit damage",
     "darmaee": "damage",
     "coibo": "combo",
     "ratupage": "rampage",
@@ -462,6 +467,7 @@ def _ocr_word_is_stat_fragment(word: str) -> bool:
         "critdamage",
         "critdmg",
         "hp",
+        "range",
         "luck",
         "drop",
         "npcdmg",
@@ -1288,6 +1294,23 @@ class AelrithForgeBot:
         except Exception:
             return 7.0
 
+    def _safe_region_screenshot(self, region):
+        try:
+            if pyautogui is None:
+                return None
+            img = pyautogui.screenshot(region=tuple(region))
+            if not hasattr(img, "convert"):
+                return None
+            return img
+        except Exception:
+            return None
+
+    def _manual_visual_change_threshold(self):
+        try:
+            return max(2.5, float(self.cfg.get("MANUAL_REROLL_VISUAL_CHANGE_THRESHOLD", 4.0)))
+        except Exception:
+            return 4.0
+
     def _verify_state_label(self, changed, unreadable, image_changed=False):
         if changed:
             return "rolling"
@@ -1457,10 +1480,67 @@ class AelrithForgeBot:
     def ocr_region(self, region, psm=7):
         return self.ocr_region_tesseract(region, psm)
 
+    def _strong_spec_ocr_candidate(self, engine, text, raw_text):
+        combined = f"{text or ''}\n{raw_text or ''}"
+        bad_panel_words = (
+            "mythical 0.2",
+            "fortune chosen > 17.5",
+            "executioner > 30",
+            "rampage > 15",
+            "the more times you do dmg",
+            "resets after 5s",
+        )
+        if any(word in normalize_text(combined) for word in bad_panel_words):
+            return False, "bad_panel_text"
+        trait = detect_trait(combined)
+        if not trait or not self.is_target_trait(trait):
+            return False, "target_trait_missing"
+        if not self.has_current_spec_marker(combined):
+            return False, "current_spec_marker_missing"
+        values, debug = self.extract_labeled_values(trait, raw_text or text, return_debug=True)
+        found = sum(value is not None for value in values)
+        needed = len(STAT_LABELS.get(trait, []))
+        if not needed or found < needed:
+            return False, f"incomplete_values:{found}/{needed or '?'}"
+        if debug.get("parse_errors"):
+            return False, "parse_errors_present"
+        if trait == "rampage" and not self._rampage_structure_details(values, debug)["usable"]:
+            return False, "rampage_structure_weak"
+        quality = self._candidate_parse_quality(trait, text, values, debug)
+        coherence = self._candidate_parse_coherence(trait, values, debug)
+        if quality < 100 or coherence < 90:
+            return False, f"quality_too_low:{quality}/{coherence}"
+        return True, f"strong_spec:{display_trait(trait)}:{found}/{needed}:{engine}"
+
+    def _strong_power_ocr_candidate(self, engine, text, raw_text):
+        combined = f"{text or ''}\n{raw_text or ''}"
+        parsed = parse_power_roll_text(combined)
+        if not parsed:
+            return False, "power_parse_missing"
+        power_key = parsed.get("power")
+        values = parsed.get("values") or {}
+        passive = parsed.get("passive")
+        quality = self._power_candidate_quality(power_key, values, combined, passive)
+        completeness = self._power_parse_completeness(power_key, values, passive)
+        enabled_power = power_key in self.enabled_powers
+        if quality < 100:
+            return False, f"power_quality_too_low:{quality}"
+        if enabled_power and not completeness["coherent"]:
+            return False, "enabled_power_incomplete"
+        return True, f"strong_power:{power_display_name(power_key)}:{quality}:{engine}"
+
+    def _stats_ocr_early_stop_candidate(self, engine, text, raw_text, fallback_only=False, full=False):
+        if fallback_only or full:
+            return False, "full_or_fallback_scan"
+        if self.roll_domain == "powers":
+            return self._strong_power_ocr_candidate(engine, text, raw_text)
+        return self._strong_spec_ocr_candidate(engine, text, raw_text)
+
     def get_stats_ocr_candidates(self, image=None, region=None, fallback_only=False, full=False, startup_fast=False, fast_loop=False):
         region = tuple(region or self.cfg["STATS_REGION"])
         candidates = []
         started = time.perf_counter()
+        early_stop_reason = ""
 
         _require_module("pyautogui", pyautogui)
         _require_module("pytesseract", pytesseract)
@@ -1486,6 +1566,19 @@ class AelrithForgeBot:
             normalized = normalize_text(raw)
             if normalized:
                 candidates.append((engine, normalized, raw))
+                early_stop, early_stop_reason = self._stats_ocr_early_stop_candidate(
+                    engine,
+                    normalized,
+                    raw,
+                    fallback_only=fallback_only,
+                    full=full,
+                )
+                if early_stop:
+                    self.log(
+                        "OCR early stop | "
+                        f"engine={engine} | reads={len(candidates)} | reason={early_stop_reason}"
+                    )
+                    break
 
         unique = []
         seen = set()
@@ -1504,6 +1597,7 @@ class AelrithForgeBot:
                 "full": bool(full),
                 "startup_fast": bool(startup_fast),
                 "fast_loop": bool(fast_loop),
+                "early_stop_reason": early_stop_reason,
                 "candidates": [
                     {
                         "engine": engine,
@@ -2148,6 +2242,8 @@ class AelrithForgeBot:
         has_roll_signal = bool(numbers or self._has_activity_stat_signal(cleaned))
         if not has_roll_signal:
             return ""
+        if detect_trait(cleaned):
+            return ""
         compact = re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
         compact = re.sub(
             r"\b(?:current|curent|curren|cument|spee|spec|specs|trait|passive|stats?)\b",
@@ -2326,6 +2422,20 @@ class AelrithForgeBot:
             return cleaned, "structured_ocr_text_changed"
 
         return cleaned, None
+
+    def _watchdog_text_only_marker_change_is_weak(self, reason, image_changed, baseline_numbers, numbers, ui_signals=None):
+        if reason not in {
+            "current_spec_marker_changed",
+            "stat_numbers_changed",
+            "trait_values_changed",
+            "structured_ocr_text_changed",
+        }:
+            return False
+        if image_changed:
+            return False
+        if not any("watchdog" in str(signal).lower() for signal in (ui_signals or [])):
+            return False
+        return True
 
     def _recovery_failure_outcome(self, samples, baseline_clean, polls, image_changed_samples):
         readable_samples = [sample for sample in samples if not sample.get("unreliable")]
@@ -2763,6 +2873,13 @@ class AelrithForgeBot:
                 _numbers,
             )
             trait_only = bool(_trait and not _stat_signal and not _numbers and not _marker)
+            if self._watchdog_text_only_marker_change_is_weak(reason, image_changed, baseline_numbers, _numbers, ui_signals):
+                self.log(
+                    f"{context} rejected text-only watchdog activity | "
+                    f"reason={reason} | image_changed={image_changed} | change_score={change_score:.2f}"
+                )
+                reason = None
+                materially_different = False
             poll_elapsed_ms = int((time.perf_counter() - poll_started) * 1000)
             verify_poll_timings.append({
                 "poll": index + 1,
@@ -3269,7 +3386,7 @@ class AelrithForgeBot:
                 context="watchdog",
             )
             return "skipped"
-        if state in ("GOD", "HIGH_VALUE"):
+        if state in ("GOD", "HIGH_VALUE", "BAD", "DISABLED"):
             self.log(f"Unexpected No-Roll Watchdog | skipped valid stop state | state={state}")
             return "skipped"
         if self.watchdog_in_progress or self.recovery_in_progress or self.manual_reroll_active:
@@ -3377,6 +3494,7 @@ class AelrithForgeBot:
                 return "skipped"
             watchdog_profile = self._watchdog_verify_profile(stage)
             fast_dead_watchdog = False
+            stale_non_target_proof = ""
             if effective_checkbox_state == "weak_enabled":
                 fast_dead_watchdog = self._watchdog_dead_weak_enabled_fast_path(
                     suspicion_details,
@@ -3424,6 +3542,7 @@ class AelrithForgeBot:
                         )
                         return "skipped"
             elif effective_checkbox_state == "ambiguous":
+                guard_started = time.perf_counter()
                 confirm_changed, confirm_text = self.stats_changed(
                     baseline,
                     "Unexpected No-Roll Watchdog ambiguous checkbox confirm",
@@ -3432,6 +3551,7 @@ class AelrithForgeBot:
                     poll_delay_override=watchdog_profile["guard_poll_delay"],
                     unreadable_fast_fail_polls=2,
                 )
+                guard_elapsed_ms = int((time.perf_counter() - guard_started) * 1000)
                 if confirm_changed:
                     guard_support = self._auto_reenable_guard_support(
                         self.last_recovery_verify_details,
@@ -3479,6 +3599,17 @@ class AelrithForgeBot:
                         context="watchdog",
                     )
                     return "skipped"
+                else:
+                    stale_non_target_proof = (
+                        (self.last_recovery_verify_details or {}).get("exit_reason")
+                        or self.last_recovery_reason
+                        or "ambiguous_guard_no_activity"
+                    )
+                    self.log(
+                        "watchdog_non_target_stale_guard_static | "
+                        f"stage={stage} | state={state or 'unknown'} | trait={trait_text} | "
+                        f"elapsed={guard_elapsed_ms}ms | stale_proof={stale_non_target_proof}"
+                    )
                 if not self._interruptible_sleep(
                     watchdog_profile["guard_recheck_delay"],
                     "unexpected no-roll watchdog ambiguous checkbox validation",
@@ -3516,33 +3647,42 @@ class AelrithForgeBot:
                     )
                     return "skipped"
                 elif effective_checkbox_state in ("ambiguous", "weak_enabled"):
-                    self.log(
-                        "Unexpected No-Roll Watchdog | suppressed ambiguous checkbox click because guard verification "
-                        "showed no strong rolling evidence and final checkbox recheck stayed unclear | "
-                        f"checkbox_state={checkbox_state} effective_state={effective_checkbox_state}"
-                    )
-                    self._set_recovery_route_snapshot(
-                        result="skipped",
-                        route_reason="ambiguous_checkbox_no_activity",
-                        auto_state=str(effective_checkbox_state),
-                        rolling_confirmed=False,
-                        failure_type="ambiguous_checkbox_no_activity",
-                        support_signals=["ambiguous_checkbox_guard"],
-                        context="watchdog",
-                    )
-                    self._write_ocr_debug_event(
-                        "unexpected_no_roll_watchdog",
-                        {
-                            "phase": "skipped",
-                            "reason": "ambiguous_checkbox_no_activity",
-                            "checkbox_state": checkbox_state,
-                            "effective_checkbox_state": effective_checkbox_state,
-                            "state": state,
-                            "trait": trait,
-                            "signature": signature,
-                        },
-                    )
-                    return "skipped"
+                    if state == "NON_TARGET" and stale_non_target_proof:
+                        self.log(
+                            "watchdog_non_target_stale_auto_reclick_allowed | "
+                            f"stage={stage} | state={state or 'unknown'} | trait={trait_text} | "
+                            f"checkbox_state={checkbox_state} | effective_checkbox_state={effective_checkbox_state} | "
+                            f"idle_for={float(idle_for or 0.0):.1f}s | panel_support=pending | "
+                            f"stale_proof={stale_non_target_proof}"
+                        )
+                    else:
+                        self.log(
+                            "Unexpected No-Roll Watchdog | suppressed ambiguous checkbox click because guard verification "
+                            "showed no strong rolling evidence and final checkbox recheck stayed unclear | "
+                            f"checkbox_state={checkbox_state} effective_state={effective_checkbox_state}"
+                        )
+                        self._set_recovery_route_snapshot(
+                            result="skipped",
+                            route_reason="ambiguous_checkbox_no_activity",
+                            auto_state=str(effective_checkbox_state),
+                            rolling_confirmed=False,
+                            failure_type="ambiguous_checkbox_no_activity",
+                            support_signals=["ambiguous_checkbox_guard"],
+                            context="watchdog",
+                        )
+                        self._write_ocr_debug_event(
+                            "unexpected_no_roll_watchdog",
+                            {
+                                "phase": "skipped",
+                                "reason": "ambiguous_checkbox_no_activity",
+                                "checkbox_state": checkbox_state,
+                                "effective_checkbox_state": effective_checkbox_state,
+                                "state": state,
+                                "trait": trait,
+                                "signature": signature,
+                            },
+                        )
+                        return "skipped"
                 elif effective_checkbox_state not in ("disabled", "ambiguous", "weak_enabled"):
                     self.log(
                         "Unexpected No-Roll Watchdog | skipped unsupported checkbox state after ambiguous recheck="
@@ -3611,6 +3751,14 @@ class AelrithForgeBot:
                     },
                 )
                 return "off_panel"
+            if stale_non_target_proof:
+                self.log(
+                    "watchdog_non_target_stale_auto_reclick_allowed | "
+                    f"stage={stage} | state={state or 'unknown'} | trait={trait_text} | "
+                    f"checkbox_state={checkbox_state} | effective_checkbox_state={effective_checkbox_state} | "
+                    f"idle_for={float(idle_for or 0.0):.1f}s | panel_support={'+'.join(panel_support) or 'none'} | "
+                    f"stale_proof={stale_non_target_proof}"
+                )
 
             self.last_watchdog_attempt_at = now
             self.last_watchdog_signature = signature
@@ -3619,17 +3767,20 @@ class AelrithForgeBot:
             elif effective_checkbox_state == "weak_enabled":
                 click_reason = "weak_enabled_dead_fast_path" if fast_dead_watchdog else "weak_enabled_compact_verify_failed"
             else:
-                click_reason = "unknown_but_rolls_stale"
+                click_reason = "non_target_stale_guard_static" if stale_non_target_proof else "unknown_but_rolls_stale"
             settle_delay = watchdog_profile["click_settle"]
+            auto_reclick_started = time.perf_counter()
             self.click(
                 self.cfg["AUTO_CHECKBOX"],
                 "Unexpected No-Roll Watchdog Auto Re-enable",
                 offset=(-self.cfg["AUTO_LEFT_NUDGE"], 0),
                 settle=settle_delay,
             )
+            auto_reclick_ms = int((time.perf_counter() - auto_reclick_started) * 1000)
             self.log(
                 "Unexpected No-Roll Watchdog | auto re-enable attempt sent | "
-                f"checkbox_state={checkbox_state} effective_state={effective_checkbox_state} reason={click_reason} stage={stage}"
+                f"checkbox_state={checkbox_state} effective_state={effective_checkbox_state} reason={click_reason} stage={stage} | "
+                f"watchdog_auto_reclick_ms={auto_reclick_ms}"
             )
             self.last_important_event = "Unexpected no-roll watchdog attempted Auto re-enable"
             verify_delay = min(
@@ -3641,11 +3792,13 @@ class AelrithForgeBot:
 
             verify_kwargs = {"ui_signals": ["watchdog_auto_reenable"]}
             verify_kwargs.update(self._stats_verify_profile("watchdog_verify", watchdog_profile=watchdog_profile))
+            verify_started = time.perf_counter()
             changed, new_text = self.stats_changed(
                 baseline,
                 "Unexpected No-Roll Watchdog verify",
                 **verify_kwargs,
             )
+            watchdog_verify_ms = int((time.perf_counter() - verify_started) * 1000)
             if changed:
                 self.last_text = new_text or baseline
                 self.last_change = time.time()
@@ -3654,7 +3807,8 @@ class AelrithForgeBot:
                 self.last_important_event = "Unexpected no-roll watchdog restored rolling"
                 self.log(
                     "Unexpected No-Roll Watchdog | verified rolling resumed | "
-                    f"checkbox_state={checkbox_state} effective_state={effective_checkbox_state}; stale signature cleared"
+                    f"checkbox_state={checkbox_state} effective_state={effective_checkbox_state}; stale signature cleared | "
+                    f"watchdog_verify_ms={watchdog_verify_ms}"
                 )
                 self.clear_recovery_failures("unexpected no-roll watchdog restored rolling")
                 self.record_decision_chain(
@@ -3669,7 +3823,11 @@ class AelrithForgeBot:
                     route_reason="watchdog_auto_reenable_verified",
                     auto_state=str(effective_checkbox_state or checkbox_state),
                     rolling_confirmed=True,
-                    support_signals=["watchdog_auto_reenable"],
+                    support_signals=(
+                        ["non_target_stale_proof", "bounded_auto_reenable"]
+                        if stale_non_target_proof
+                        else ["watchdog_auto_reenable"]
+                    ),
                     context="watchdog",
                 )
                 self._write_ocr_debug_event(
@@ -4187,6 +4345,28 @@ class AelrithForgeBot:
             }
         return support
 
+    def _manual_reroll_visual_resume_support(self, baseline_img, popup_recently_cleared=False):
+        if not popup_recently_cleared or baseline_img is None:
+            return {"strong": False, "reason": "visual_resume_unavailable", "signals": []}
+        current_img = self._safe_region_screenshot(self.cfg["STATS_REGION"])
+        if current_img is None:
+            return {"strong": False, "reason": "visual_resume_missing_sample", "signals": []}
+        change_score = self._region_change_score(baseline_img, current_img)
+        signature_changed = self._region_signature(baseline_img) != self._region_signature(current_img)
+        threshold = self._manual_visual_change_threshold()
+        strong = bool(signature_changed and change_score >= threshold)
+        signals = ["recent_popup_clear"]
+        if strong:
+            signals.append("stats_region_visual_change")
+        return {
+            "strong": strong,
+            "reason": "popup_cleared_stats_region_visual_refresh" if strong else "stats_region_visual_refresh_too_weak",
+            "signals": signals,
+            "image_changed_samples": 1 if strong else 0,
+            "max_change_score": round(change_score, 2),
+            "threshold": round(threshold, 2),
+        }
+
     def _compact_manual_reroll_resume_verify(self, baseline, transition_profile, popup_recently_cleared=False):
         context = "Manual Reroll Auto Resume Compact Verify"
         changed, new_text = self.stats_changed(
@@ -4431,6 +4611,42 @@ class AelrithForgeBot:
             "passive_detected": bool(passive and passive.get("detected")),
         }
 
+    def _startup_fast_spec_bad_support(self, state, trait, summary, ocr_text, missing, chain=None):
+        if self.roll_domain != "specs" or state not in ("BAD", "DISABLED"):
+            return {"strong": False, "values": {}, "value_count": 0}
+        trait = canonical_spec_trait(trait)
+        if not trait or not self.is_target_trait(trait):
+            return {"strong": False, "values": {}, "value_count": 0}
+        text = f"{summary or ''}\n{ocr_text or ''}"
+        if not self.has_current_spec_marker(text):
+            return {"strong": False, "values": {}, "value_count": 0}
+        chain = dict(chain or {})
+        parsed_values = dict(chain.get("parsed_values") or {})
+        values = self.extract_labeled_values(trait, text)
+        labels = STAT_LABELS.get(trait, [])
+        fallback_values = {
+            label: values[index] if index < len(values) else None
+            for index, label in enumerate(labels)
+        }
+        merged_values = {
+            label: parsed_values.get(label) if parsed_values.get(label) is not None else fallback_values.get(label)
+            for label in labels
+        }
+        value_count = sum(value is not None for value in merged_values.values())
+        needed = len(labels)
+        enough_values = bool(needed) and value_count >= needed
+        strong = state == "DISABLED" or (bool(missing) and enough_values)
+        return {"strong": bool(strong), "values": merged_values, "value_count": value_count}
+
+    def _startup_followup_proves_different_spec(self, initial_trait, followup_state, followup_trait, followup_text):
+        if followup_state in ("GOD", "HIGH_VALUE"):
+            return True
+        initial_trait = canonical_spec_trait(initial_trait)
+        followup_trait = canonical_spec_trait(followup_trait) or self.detect_rollable_trait(followup_text or "")
+        if not followup_trait or followup_trait == "non_target":
+            return False
+        return followup_trait != initial_trait
+
     def _startup_power_bad_from_verify_samples(self, label, verify_details=None):
         if self.roll_domain != "powers":
             return "none"
@@ -4556,10 +4772,11 @@ class AelrithForgeBot:
         if delay and not self._interruptible_sleep(delay, "power BAD confirmation delay"):
             return False
         if fast_first:
-            fast_route = "fast_startup_power_probe" if "startup" in str(context).lower() else "fast_power_probe"
+            startup_confirm = "startup" in str(context).lower()
+            fast_route = "fast_startup_power_probe" if startup_confirm else "fast_power_probe"
             confirm_state, confirm_trait, _summary, _ocr_text, confirm_missing, _near = self.check_roll(
                 allow_fallback=False,
-                startup_fast=True,
+                startup_fast=startup_confirm,
             )
             confirm_chain = dict(self.last_decision_chain or {})
             stable, confirm_required = self._power_bad_confirmation_stable(
@@ -4576,7 +4793,7 @@ class AelrithForgeBot:
                     f"{context} confirmed | route={fast_route} | trait={power_display_name(trait)} | "
                     f"missing={' ; '.join(missing or []) or 'none'} | "
                     f"quality={confirm_chain.get('power_candidate_quality', 'unknown')} | "
-                    f"required={confirm_required}"
+                    f"required={confirm_required} | startup_profile={startup_confirm}"
                 )
                 return True
             self.log(
@@ -4585,7 +4802,7 @@ class AelrithForgeBot:
                 f"confirm_state={confirm_state} confirm_trait={power_display_name(confirm_trait) if confirm_trait else 'unknown'} | "
                 f"initial_required={initial_required} confirm_required={confirm_required} | "
                 f"initial_missing={' ; '.join(missing or []) or 'none'} | "
-                f"confirm_missing={' ; '.join(confirm_missing or []) or 'none'}"
+                f"confirm_missing={' ; '.join(confirm_missing or []) or 'none'} | startup_profile={startup_confirm}"
             )
             return False
         self.log(f"{context} using full fallback confirmation | reason=fast_confirmation_not_requested")
@@ -4654,6 +4871,61 @@ class AelrithForgeBot:
         self.log(f"Reroll popup still present after retry | {reason}")
         self.alert_popup_stuck(reason)
         return False
+
+    def _manual_reroll_fast_popup_confirm(self, baseline_img, reason, transition_profile):
+        if baseline_img is None:
+            return None, {"route": "visual_unavailable", "reason": "missing_baseline"}
+        before_yes = self._safe_region_screenshot(self.cfg["POPUP_REGION"])
+        if before_yes is None:
+            return None, {"route": "visual_unavailable", "reason": "missing_popup_sample"}
+        threshold = self._manual_visual_change_threshold()
+        appeared_score = self._region_change_score(baseline_img, before_yes)
+        appeared = bool(self._region_signature(baseline_img) != self._region_signature(before_yes) and appeared_score >= threshold)
+        if not appeared:
+            return None, {
+                "route": "visual_ambiguous",
+                "reason": "popup_region_did_not_change",
+                "appeared_score": round(appeared_score, 2),
+            }
+
+        click_settle = 0.12 if self._startup_context_active() else 0.16
+        self.log(
+            "Manual reroll fast popup visual confirm | "
+            f"{reason} | appeared_score={appeared_score:.2f} | threshold={threshold:.2f}"
+        )
+        self.click(self.cfg["YES_BUTTON"], "Confirm Popup", settle=click_settle)
+        retry_delay = max(0.02, float(self.cfg.get("POPUP_RETRY_DELAY", 0.04)))
+        if not self._interruptible_sleep(retry_delay, "manual reroll fast popup clear visual delay"):
+            return False, {
+                "route": "fast_visual",
+                "reason": "manual_stop",
+                "appeared_score": round(appeared_score, 2),
+            }
+
+        after_yes = self._safe_region_screenshot(self.cfg["POPUP_REGION"])
+        if after_yes is None:
+            return None, {
+                "route": "visual_unavailable",
+                "reason": "missing_clear_sample",
+                "appeared_score": round(appeared_score, 2),
+            }
+        cleared_score = self._region_change_score(before_yes, after_yes)
+        cleared = bool(self._region_signature(before_yes) != self._region_signature(after_yes) and cleared_score >= threshold)
+        if not cleared:
+            return None, {
+                "route": "visual_ambiguous",
+                "reason": "popup_region_did_not_clear",
+                "appeared_score": round(appeared_score, 2),
+                "cleared_score": round(cleared_score, 2),
+            }
+        self._mark_startup_popup_confirmed()
+        self.last_important_event = f"Reroll popup cleared ({reason})"
+        return True, {
+            "route": "fast_visual",
+            "reason": "popup_region_changed_then_cleared",
+            "appeared_score": round(appeared_score, 2),
+            "cleared_score": round(cleared_score, 2),
+        }
 
     def confirm_popup_if_present(self, reason="popup"):
         return self.clear_reroll_popup(reason=reason)
@@ -4822,7 +5094,11 @@ class AelrithForgeBot:
                 startup_preflight_rolling_state = self.last_recovery_verify_state if not preflight_changed else "rolling"
             self.log(
                 f"[Startup Observe] auto_state=pending | rolling_state={startup_preflight_rolling_state} | "
-                f"popup_state={startup_popup_state} | phase=preflight | elapsed={int((time.perf_counter() - preflight_started) * 1000)}ms | fast_non_target_preflight={fast_non_target_preflight} | compact_non_target_preflight={compact_non_target_preflight} | reused_popup_clear={reused_popup_clear} | bridge_fallback_reason={bridge_fallback_reason}"
+                f"popup_state={startup_popup_state} | phase=preflight | "
+                f"elapsed={int((time.perf_counter() - preflight_started) * 1000)}ms | "
+                f"startup_preflight_ms={int((time.perf_counter() - preflight_started) * 1000)} | "
+                f"fast_non_target_preflight={fast_non_target_preflight} | compact_non_target_preflight={compact_non_target_preflight} | "
+                f"reused_popup_clear={reused_popup_clear} | bridge_fallback_reason={bridge_fallback_reason}"
             )
             if preflight_changed:
                 preflight_details = self.last_recovery_verify_details or {}
@@ -5763,39 +6039,109 @@ class AelrithForgeBot:
 
         startup_bad_current_spec = self._startup_context_active() and "startup current" in reason_text.lower()
         transition_profile = self._manual_reroll_timing_profile(startup_bad_current_spec)
+        manual_timings = {
+            "roll_click_ms": 0,
+            "popup_detect_ms": 0,
+            "popup_clear_ms": 0,
+            "auto_checkbox_ms": 0,
+            "resume_verify_ms": 0,
+            "popup_route": "pending",
+        }
+
+        def log_manual_timing(result):
+            total_ms = int((time.perf_counter() - started) * 1000)
+            self.log(
+                "Manual reroll timing | "
+                f"result={result} | route={manual_timings.get('popup_route', 'unknown')} | "
+                f"roll_click={manual_timings.get('roll_click_ms', 0)}ms | "
+                f"popup_detect={manual_timings.get('popup_detect_ms', 0)}ms | "
+                f"popup_clear={manual_timings.get('popup_clear_ms', 0)}ms | "
+                f"auto_checkbox={manual_timings.get('auto_checkbox_ms', 0)}ms | "
+                f"resume_verify={manual_timings.get('resume_verify_ms', 0)}ms | "
+                f"total={total_ms}ms | {reroll_context}"
+            )
+
+        popup_baseline_img = self._safe_region_screenshot(self.cfg["POPUP_REGION"])
+        stats_baseline_img = self._safe_region_screenshot(self.cfg["STATS_REGION"])
         roll_click_settle = transition_profile["roll_click_settle"]
         post_click_settle = transition_profile["post_click_settle"]
+        roll_click_started = time.perf_counter()
         self.click(self.cfg["ROLL_BUTTON"], "Manual Reroll", settle=roll_click_settle)
+        manual_timings["roll_click_ms"] = int((time.perf_counter() - roll_click_started) * 1000)
         if not self._interruptible_sleep(post_click_settle, "manual reroll settle"):
             return finish(False)
 
         popup_started = time.perf_counter()
         saw_popup = False
         popup_verified_clear = False
+        fast_popup_result, fast_popup_details = self._manual_reroll_fast_popup_confirm(
+            popup_baseline_img,
+            "manual reroll fast visual",
+            transition_profile,
+        )
+        if fast_popup_result is True:
+            saw_popup = True
+            popup_verified_clear = True
+            manual_timings["popup_route"] = "fast_visual"
+            manual_timings["popup_detect_ms"] = int((time.perf_counter() - popup_started) * 1000)
+            manual_timings["popup_clear_ms"] = manual_timings["popup_detect_ms"]
+            self.popup_clear_duration_total += time.perf_counter() - popup_started
+            self.popup_clear_duration_count += 1
+            avg_ms = int((self.popup_clear_duration_total / max(1, self.popup_clear_duration_count)) * 1000)
+            self.log(
+                "Reroll popup cleared | manual reroll fast visual | "
+                f"route=fast_visual | appeared_score={fast_popup_details.get('appeared_score', 0)} | "
+                f"cleared_score={fast_popup_details.get('cleared_score', 0)} | "
+                f"elapsed={manual_timings['popup_clear_ms']}ms | avg_popup_clear={avg_ms}ms"
+            )
+            self._record_timing_event(
+                "manual_reroll_popup_confirm",
+                time.perf_counter() - popup_started,
+                result="fast_visual",
+                domain=self.roll_domain,
+                target=self._manual_reroll_target_kind(),
+            )
+        elif fast_popup_result is False:
+            manual_timings["popup_route"] = "fast_visual_failed"
+            log_manual_timing("failed")
+            return finish(False)
+        else:
+            manual_timings["popup_route"] = fast_popup_details.get("route", "ocr_fallback")
+            self.log(
+                "Manual reroll fast popup visual fallback | "
+                f"route={manual_timings['popup_route']} | reason={fast_popup_details.get('reason', 'unknown')} | "
+                f"appeared_score={fast_popup_details.get('appeared_score', 0)} | "
+                f"cleared_score={fast_popup_details.get('cleared_score', 0)}"
+            )
         popup_timeout_default = transition_profile["popup_timeout"]
         popup_poll_default = transition_profile["popup_poll_delay"]
         deadline = time.time() + max(0.5, float(self.cfg.get("MANUAL_POPUP_TIMEOUT", popup_timeout_default)))
         poll_delay = max(0.05, float(self.cfg.get("MANUAL_POPUP_POLL_DELAY", popup_poll_default)))
         attempt = 1
-        while time.time() < deadline:
+        while not saw_popup and time.time() < deadline:
             if self._stop_requested("manual reroll flow"):
                 return finish(False)
             popup_context = f"manual reroll popup poll {attempt}"
             if self._popup_active_checked(log=True, context=popup_context, fast=False):
                 saw_popup = True
+                manual_timings["popup_route"] = "ocr_fallback"
                 if not self.clear_reroll_popup(f"manual reroll attempt {attempt}", already_detected=True):
                     self.log("Manual reroll popup recovery failed; continuing only after defensive re-checks.")
                     break
                 popup_verified_clear = True
+                manual_timings["popup_clear_ms"] = int((time.perf_counter() - popup_started) * 1000)
                 break
             attempt += 1
             if not self._interruptible_sleep(poll_delay, "manual reroll popup polling"):
                 return finish(False)
+        if manual_timings["popup_detect_ms"] <= 0:
+            manual_timings["popup_detect_ms"] = int((time.perf_counter() - popup_started) * 1000)
         if not saw_popup:
             self.log(
                 "Manual reroll popup not confirmed; pressing fallback Yes | "
                 f"{reroll_context}"
             )
+            manual_timings["popup_route"] = "direct_confirm"
             if self._stop_requested("manual reroll flow"):
                 return finish(False)
             self.click(self.cfg["YES_BUTTON"], "Confirm Reroll", settle=0.22 if startup_bad_current_spec else 0.30)
@@ -5815,6 +6161,7 @@ class AelrithForgeBot:
                 domain=self.roll_domain,
                 target=self._manual_reroll_target_kind(),
             )
+            manual_timings["popup_clear_ms"] = int((time.perf_counter() - popup_started) * 1000)
         else:
             cleared_settle = transition_profile["cleared_settle"]
             if not self._interruptible_sleep(cleared_settle, "manual reroll cleared settle"):
@@ -5827,10 +6174,12 @@ class AelrithForgeBot:
             self._record_timing_event(
                 "manual_reroll_popup_confirm",
                 time.perf_counter() - popup_started,
-                result="detected_and_cleared",
+                result="detected_and_cleared" if manual_timings.get("popup_route") != "fast_visual" else "fast_visual",
                 domain=self.roll_domain,
                 target=self._manual_reroll_target_kind(),
             )
+            if manual_timings["popup_clear_ms"] <= 0:
+                manual_timings["popup_clear_ms"] = int((time.perf_counter() - popup_started) * 1000)
 
         if not popup_verified_clear and self._popup_active_checked(log=True, context="manual reroll before auto resume", fast=False):
             if not self.clear_reroll_popup("manual reroll before auto resume", already_detected=True):
@@ -5843,7 +6192,9 @@ class AelrithForgeBot:
         if self._stop_requested("manual reroll flow"):
             return finish(False)
         auto_resume_started = time.perf_counter()
+        auto_checkbox_started = time.perf_counter()
         auto_result = self.ensure_auto_enabled("Manual Reroll Auto Resume", allow_uncertain_enable=True)
+        manual_timings["auto_checkbox_ms"] = int((time.perf_counter() - auto_checkbox_started) * 1000)
         if auto_result == "weak_enabled":
             self.log(
                 "Manual reroll auto resume has weak-enabled checkbox lean; attempting compact resume verify | "
@@ -5872,6 +6223,8 @@ class AelrithForgeBot:
                     auto_state=str(auto_result or "unknown"),
                     domain=self.roll_domain,
                 )
+                manual_timings["resume_verify_ms"] = int((time.perf_counter() - auto_resume_started) * 1000) - manual_timings["auto_checkbox_ms"]
+                log_manual_timing("confirmed")
                 self.log(
                     f"Manual reroll flow complete | {reason_text} | {reroll_context} | "
                     f"elapsed={int((time.perf_counter() - started) * 1000)}ms"
@@ -5938,6 +6291,8 @@ class AelrithForgeBot:
                 auto_state=str(auto_result or "unknown"),
                 domain=self.roll_domain,
             )
+            manual_timings["resume_verify_ms"] = int((time.perf_counter() - auto_resume_started) * 1000) - manual_timings["auto_checkbox_ms"]
+            log_manual_timing("confirmed")
             self.log(
                 f"Manual reroll flow complete | {reason_text} | {reroll_context} | "
                 f"elapsed={int((time.perf_counter() - started) * 1000)}ms"
@@ -5972,6 +6327,51 @@ class AelrithForgeBot:
             )
             if not self._interruptible_sleep(resume_verify_delay, "manual reroll auto resume delay"):
                 return finish(False)
+        visual_support = self._manual_reroll_visual_resume_support(
+            stats_baseline_img,
+            popup_recently_cleared=popup_verified_clear,
+        )
+        if visual_support.get("strong"):
+            if auto_result in AUTO_ENABLE_CLICK_RESULTS:
+                self.log(
+                    "Manual reroll visual refresh observed after Auto click; running bounded resume verify | "
+                    f"result={auto_result} | reason={visual_support.get('reason', 'none')} | "
+                    f"change_score={visual_support.get('max_change_score', 0.0)} | {reroll_context}"
+                )
+            else:
+                self.last_change = time.time()
+                self.last_manual_reroll_confirmed_at = time.perf_counter()
+                self.last_manual_reroll_confirm_reason = reason_text
+                self._set_recovery_route_snapshot(
+                    result="confirmed",
+                    route_reason="manual_reroll_visual_resume_confirmed",
+                    auto_state=str(auto_result or "unknown"),
+                    rolling_confirmed=True,
+                    support_signals=list(visual_support.get("signals") or []),
+                    context="manual_reroll",
+                )
+                self.log(
+                    "Manual reroll auto resume confirmed by visual roll refresh | "
+                    f"result={auto_result} | reason={visual_support.get('reason', 'none')} | "
+                    f"support={'+'.join(visual_support.get('signals', [])) or 'none'} | "
+                    f"change_score={visual_support.get('max_change_score', 0.0)} | "
+                    f"threshold={visual_support.get('threshold', 0.0)} | {reroll_context}"
+                )
+                self._record_timing_event(
+                    "manual_reroll_auto_resume",
+                    time.perf_counter() - auto_resume_started,
+                    result="visual_refresh_confirmed",
+                    auto_state=str(auto_result or "unknown"),
+                    domain=self.roll_domain,
+                )
+                manual_timings["resume_verify_ms"] = int((time.perf_counter() - auto_resume_started) * 1000) - manual_timings["auto_checkbox_ms"]
+                log_manual_timing("confirmed")
+                self.log(
+                    f"Manual reroll flow complete | {reason_text} | {reroll_context} | "
+                    f"elapsed={int((time.perf_counter() - started) * 1000)}ms"
+                )
+                return finish(True)
+        resume_verify_started = time.perf_counter()
         changed, _verify_text = self.stats_changed(
             resume_baseline,
             "Manual Reroll Auto Resume verify",
@@ -5981,6 +6381,7 @@ class AelrithForgeBot:
                 popup_known_false=popup_verified_clear,
             ),
         )
+        manual_timings["resume_verify_ms"] = int((time.perf_counter() - resume_verify_started) * 1000)
         if not changed:
             support = self._manual_reroll_resume_support(
                 self.last_recovery_verify_details,
@@ -6014,6 +6415,7 @@ class AelrithForgeBot:
                     auto_state=str(auto_result or "unknown"),
                     domain=self.roll_domain,
                 )
+                log_manual_timing("confirmed")
                 self.log(
                     f"Manual reroll flow complete | {reason_text} | {reroll_context} | "
                     f"elapsed={int((time.perf_counter() - started) * 1000)}ms"
@@ -6061,6 +6463,7 @@ class AelrithForgeBot:
             support_signals=["resume_verify"],
             context="manual_reroll",
         )
+        log_manual_timing("confirmed")
         self.log(
             f"Manual reroll flow complete | {reason_text} | {reroll_context} | "
             f"elapsed={int((time.perf_counter() - started) * 1000)}ms"
@@ -6200,7 +6603,7 @@ class AelrithForgeBot:
             return val
         return None
 
-    def _search_label_value(self, text, labels, min_v=None, max_v=None, exclude_before=()):
+    def _search_label_value(self, text, labels, min_v=None, max_v=None, exclude_before=(), reject_orphan_prefix=False):
         normalized_text = normalize_stat_tokens(text)
 
         def valid(value):
@@ -6226,7 +6629,17 @@ class AelrithForgeBot:
                 after_numbers = extract_numbers(after)
                 if after_numbers:
                     value = after_numbers[0]
-                    if valid(value):
+                    next_stat = re.search(
+                        r"\b(combo_ramp|damage|crit_rate|crit_damage|npc_damage|drop|luck)\b",
+                        after,
+                    )
+                    leading = after[: next_stat.start()] if next_stat else after
+                    orphan_prefixed = bool(
+                        reject_orphan_prefix
+                        and 0 <= value <= 9
+                        and re.fullmatch(r"\s*[a-z]\s+\d(?:\.0+)?\s*", leading or "")
+                    )
+                    if valid(value) and not orphan_prefixed:
                         return value
 
                 before = normalized_text[max(0, match.start() - 28) : match.start()]
@@ -6297,6 +6710,9 @@ class AelrithForgeBot:
         integer_like = abs(value - round(value)) < 0.001
         if integer_like and value >= 10 and 0 <= decimal_shifted <= cap + 0.1:
             return round(decimal_shifted, 1), f"{value:g} -> {decimal_shifted:g}"
+        hundred_shifted = value / 100.0
+        if trait == "rampage" and index == 3 and integer_like and value >= 200 and 0 <= hundred_shifted <= cap + 0.1:
+            return round(hundred_shifted, 2), f"{value:g} -> {hundred_shifted:g}"
 
         return value, ""
 
@@ -6351,6 +6767,22 @@ class AelrithForgeBot:
                 )
         return chosen
 
+    def _filter_label_numbers(self, trait, stat_key, span, numbers, source, debug):
+        filtered = list(numbers or [])
+        if trait != "rampage" or stat_key != "damage" or len(filtered) != 1:
+            return filtered
+        value = filtered[0]
+        compact_span = re.sub(r"\s+", " ", normalize_stat_tokens(span or "")).strip()
+        if 0 <= value <= 9 and re.fullmatch(r"[a-z]\s+\d(?:\.0+)?", compact_span):
+            debug.setdefault("parse_warnings", []).append(
+                f"Damage: ignored orphan OCR debris {compact_span!r} from {source}"
+            )
+            debug["detected_labels"].append(
+                f"Damage ignored orphan OCR debris {compact_span!r} | source={source}"
+            )
+            return []
+        return filtered
+
     def _extract_values_from_segment(self, trait, segment, values, debug):
         stat_keys = self._trait_stat_keys(trait)
         if not stat_keys:
@@ -6378,6 +6810,14 @@ class AelrithForgeBot:
             next_start = matches[idx + 1].start() if idx + 1 < len(matches) else len(normalized)
             after = normalized[match.end() : next_start]
             after_numbers = extract_numbers(after)
+            after_numbers = self._filter_label_numbers(
+                trait,
+                stat_key,
+                after,
+                after_numbers,
+                f"alias {stat_key} in {segment}",
+                debug,
+            )
             if after_numbers:
                 chosen = self._select_label_number(trait, stat_key, after_numbers, f"alias {stat_key} in {segment}", debug)
                 if chosen is not None:
@@ -6420,6 +6860,14 @@ class AelrithForgeBot:
             next_start = min(later_matches) if later_matches else len(normalized)
             span = normalized[match.end() : next_start]
             numbers = extract_numbers(span)
+            numbers = self._filter_label_numbers(
+                "rampage",
+                stat_key,
+                span,
+                numbers,
+                f"ordered alias {stat_key} in {span.strip() or normalized}",
+                debug,
+            )
             if numbers:
                 source = f"ordered alias {stat_key} in {span.strip() or normalized}"
                 chosen = self._select_label_number("rampage", stat_key, numbers, source, debug)
@@ -6579,6 +7027,7 @@ class AelrithForgeBot:
                     r"combo\s*ramp\D{0,12}\+?([0-9]+(?:\.[0-9]+)?)",
                     r"\+?([0-9]+(?:\.[0-9]+)?)\D{0,12}combo\s*ramp",
                     r"rampage\D{0,14}combo\s*ramp\D{0,12}\+?([0-9]+(?:\.[0-9]+)?)",
+                    r"rampage\D{0,24}\+?([0-9]+(?:\.[0-9]+)?)\D{0,24}cap\D{0,8}damage",
                 ],
                 min_v=0,
                 max_v=30,
@@ -6589,8 +7038,8 @@ class AelrithForgeBot:
             damage = self._search_value(
                 t,
                 [
-                    r"cap\D{0,8}damage\D{0,6}([0-9]+(?:\.[0-9]+)?)",
-                    r"(?:^|[|;])\s*damage\D{0,12}\+?([0-9]+(?:\.[0-9]+)?)",
+                    r"cap\D{0,8}damage[\s.,:%+\-]{0,6}([0-9]+(?:\.[0-9]+)?)",
+                    r"(?:^|[|;])\s*damage[\s.,:%+\-]{0,12}\+?([0-9]+(?:\.[0-9]+)?)",
                 ],
                 min_v=0,
                 max_v=30,
@@ -6602,6 +7051,7 @@ class AelrithForgeBot:
                     min_v=0,
                     max_v=30,
                     exclude_before=("crit",),
+                    reject_orphan_prefix=True,
                 )
             crit_rate = self._search_value(
                 t,
@@ -7523,6 +7973,9 @@ class AelrithForgeBot:
                 break
 
         if not trait:
+            target_structure = self._target_stat_structure_result_from_candidates(usable, last_text)
+            if target_structure:
+                return target_structure
             rollable_non_target = None
             rollable_source = None
             for engine, text, raw_text in usable:
@@ -7894,6 +8347,71 @@ class AelrithForgeBot:
         needed = len(STAT_LABELS.get(trait, []))
         found = sum(value is not None for value in values)
         return found < needed
+
+    def _target_stat_structure_result_from_candidates(self, usable, last_text):
+        best = None
+        for engine, text, raw_text in usable:
+            combined = "\n".join(part for part in (text, raw_text) if str(part or "").strip())
+            cleaned = normalize_text(combined)
+            if not self.has_current_spec_marker(cleaned):
+                continue
+            if detect_trait(cleaned):
+                continue
+            if "combo" not in cleaned and "comboramp" not in cleaned:
+                continue
+            values, debug = self.extract_labeled_values("rampage", combined, return_debug=True)
+            structure = self._rampage_structure_details(values, debug)
+            value_count = sum(value is not None for value in values)
+            if not (structure.get("usable") and structure.get("combo_present") and value_count >= 3):
+                continue
+            quality = self._candidate_parse_quality("rampage", text, values, debug)
+            coherence = self._candidate_parse_coherence("rampage", values, debug)
+            candidate = {
+                "engine": engine,
+                "text": text,
+                "raw_text": raw_text,
+                "values": values,
+                "debug": debug,
+                "quality": quality,
+                "coherence": coherence,
+                "score": quality + coherence,
+                "usable": True,
+                "fragment_reason": structure.get("reason", "usable"),
+                "has_marker": True,
+            }
+            if best is None or (candidate["score"], candidate["quality"]) > (best["score"], best["quality"]):
+                best = candidate
+        if not best:
+            return None
+        values = list(best["values"])
+        merged_debug = {
+            "raw_text": best["raw_text"],
+            "normalized_text": best["text"],
+            "detected_labels": list(best["debug"].get("detected_labels") or []),
+            "assigned_values": dict(zip(STAT_LABELS["rampage"], values)),
+            "extracted_numbers": list(best["debug"].get("extracted_numbers") or []),
+            "parse_errors": list(best["debug"].get("parse_errors") or []),
+            "parse_warnings": list(best["debug"].get("parse_warnings") or []),
+            "chosen_source": best["engine"],
+            "trait_inferred_from": "rampage_stat_structure",
+        }
+        result = {
+            "trait": "rampage",
+            "last_text": last_text,
+            "parsed": [best],
+            "merged_values": values,
+            "merged_debug": merged_debug,
+            "source_text": best["text"],
+            "source_name": f"{best['engine']}:inferred_rampage_structure",
+            "has_marker": True,
+            "best_quality": best["quality"],
+        }
+        self.log(
+            "Possible target mythical stat structure detected | "
+            f"trait=Rampage | source={best['engine']} | labels={sum(value is not None for value in values)}/4"
+        )
+        self._record_ocr_candidate_debug(result, "inferred_rampage_stat_structure")
+        return result
 
     def _stat_only_non_target_result_from_parsed(self, parsed, source_name="spec_fast_loop"):
         text = str((parsed or {}).get("last_text") or (parsed or {}).get("source_text") or "")
@@ -10121,11 +10639,14 @@ class AelrithForgeBot:
     def startup_check_current_roll(self):
         fast_started = time.perf_counter()
         fast_state, fast_trait, fast_summary, fast_ocr_text, fast_missing, fast_near = self.check_roll(allow_fallback=False, startup_fast=True)
+        fast_chain = dict(self.last_decision_chain or {})
+        fast_ocr_candidate_debug = dict(self.last_ocr_candidate_debug or {})
         fast_trait_text = display_trait(fast_trait) if fast_trait else "unknown"
         fast_elapsed_ms = int((time.perf_counter() - fast_started) * 1000)
         self.log(
             "[Startup Verify] Startup fast current-spec probe | "
-            f"state={fast_state} trait={fast_trait_text} | elapsed={fast_elapsed_ms}ms | strategy=startup_fast_non_target_probe"
+            f"state={fast_state} trait={fast_trait_text} | elapsed={fast_elapsed_ms}ms | "
+            f"startup_fast_probe_ms={fast_elapsed_ms} | strategy=startup_fast_non_target_probe"
         )
         if fast_state == "NON_TARGET":
             self.last_trait_seen = fast_trait or self.last_trait_seen
@@ -10234,6 +10755,7 @@ class AelrithForgeBot:
             self.log(
                 "[Startup Verify] Startup fast current-spec check | "
                 f"state={state} trait={trait_text} | elapsed={fast_elapsed_ms}ms | "
+                f"startup_fast_probe_ms={fast_elapsed_ms} | startup_full_validation_skipped=True | "
                 "strategy=trusted_startup_fast_power_probe"
             )
             self.log(
@@ -10243,13 +10765,70 @@ class AelrithForgeBot:
                 f"passive_detected={fast_power_support.get('passive_detected', False)}"
             )
         else:
-            started = time.perf_counter()
-            state, trait, summary, ocr_text, missing, near = self.check_roll(allow_fallback=False)
-            trait_text = display_trait(trait) if trait else "unknown"
-            self.log(
-                "[Startup Verify] Startup fast current-spec check | "
-                f"state={state} trait={trait_text} | elapsed={int((time.perf_counter() - started) * 1000)}ms | strategy=full_validation_after_probe"
+            fast_spec_support = self._startup_fast_spec_bad_support(
+                fast_state,
+                fast_trait,
+                fast_summary,
+                fast_ocr_text,
+                fast_missing,
+                fast_chain,
             )
+            if fast_spec_support["strong"]:
+                state, trait, summary, ocr_text, missing, near = (
+                    fast_state,
+                    fast_trait,
+                    fast_summary,
+                    fast_ocr_text,
+                    fast_missing,
+                    fast_near,
+                )
+                self.last_decision_chain = fast_chain
+                self.last_ocr_candidate_debug = fast_ocr_candidate_debug
+                self.log(
+                    "[Startup Verify] Startup fast current-spec check | "
+                    f"state={state} trait={fast_trait_text} | elapsed={fast_elapsed_ms}ms | "
+                    f"startup_fast_probe_ms={fast_elapsed_ms} | startup_full_validation_skipped=True | "
+                    "strategy=trusted_startup_fast_spec_probe"
+                )
+                self.log(
+                    "Startup fast Spec probe accepted strong BAD/DISABLED mythical evidence; "
+                    f"skipping slower full current-spec scan | values={fast_spec_support['values']} | "
+                    f"labels={fast_spec_support['value_count']}/{len(STAT_LABELS.get(fast_trait, [])) or '?'}"
+                )
+            else:
+                started = time.perf_counter()
+                state, trait, summary, ocr_text, missing, near = self.check_roll(allow_fallback=False)
+                full_validation_ms = int((time.perf_counter() - started) * 1000)
+                trait_text = display_trait(trait) if trait else "unknown"
+                self.log(
+                    "[Startup Verify] Startup fast current-spec check | "
+                    f"state={state} trait={trait_text} | elapsed={full_validation_ms}ms | "
+                    f"startup_fast_probe_ms={fast_elapsed_ms} | startup_full_validation_skipped=False | "
+                    "strategy=full_validation_after_probe"
+                )
+                followup_proves_changed = self._startup_followup_proves_different_spec(
+                    fast_trait,
+                    state,
+                    trait,
+                    ocr_text or summary,
+                )
+                if fast_spec_support["strong"] and state in ("NON_TARGET", "ROLLING") and not followup_proves_changed:
+                    self.log(
+                        "Startup retained first strong BAD/DISABLED Spec after weak follow-up | "
+                        f"initial_state={fast_state} initial_trait={display_trait(fast_trait)} | "
+                        f"followup_state={state} followup_trait={display_trait(trait) if trait else 'unknown'} | "
+                        f"values={fast_spec_support['values']} | reason=followup_did_not_prove_roll_changed"
+                    )
+                    state, trait, summary, ocr_text, missing, near = (
+                        fast_state,
+                        fast_trait,
+                        fast_summary,
+                        fast_ocr_text,
+                        fast_missing,
+                        fast_near,
+                    )
+                    self.last_decision_chain = fast_chain
+                    self.last_ocr_candidate_debug = fast_ocr_candidate_debug
 
         if state == "GOD":
             self.last_trait_seen = trait or self.last_trait_seen

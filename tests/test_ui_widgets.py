@@ -10,7 +10,7 @@ try:
 except ModuleNotFoundError:
     raise unittest.SkipTest("PySide6 is not installed")
 
-from aelrith_forge import APP_DISPLAY_NAME, APP_VERSION
+from aelrith_forge import APP_DISPLAY_NAME, APP_PUBLIC_VERSION
 from aelrith_forge.backend.controller import BotController
 from aelrith_forge.ui import main_window as main_window_module
 from aelrith_forge.ui.main_window import MainWindow
@@ -98,7 +98,7 @@ class UiWidgetTests(unittest.TestCase):
         self.assertEqual(window.passive_shards_value.text(), "-")
         self.assertEqual(window.power_shards_value.text(), "-")
         self.assertEqual(window.windowTitle(), APP_DISPLAY_NAME)
-        self.assertTrue(any(label.text() == APP_VERSION for label in window.findChildren(QLabel)))
+        self.assertTrue(any(label.text() == APP_PUBLIC_VERSION for label in window.findChildren(QLabel)))
         self.assertTrue(hasattr(window.settings_page, "power_shard_region_edit"))
         window.settings_page.power_shard_region_edit.setText("10,20,30,40")
         window.settings_page.power_alerts_check.setChecked(True)

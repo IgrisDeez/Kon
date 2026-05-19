@@ -8,7 +8,8 @@ from tempfile import TemporaryDirectory
 
 import aelrith_forge.backend.bot as bot_module
 import aelrith_forge.backend.controller as controller_module
-from aelrith_forge import APP_VERSION
+from aelrith_forge import APP_DISPLAY_NAME, APP_PUBLIC_VERSION, APP_VERSION
+from aelrith_forge.version import APP_PUBLIC_VERSION as PUBLIC_VERSION_METADATA
 from aelrith_forge.version import APP_VERSION as VERSION_METADATA
 from aelrith_forge.backend.bot import (
     AelrithForgeBot,
@@ -89,6 +90,9 @@ class ActivityStubBot(AelrithForgeBot):
         if self.samples:
             return self.samples.pop(0)
         return ""
+
+    def _ocr_tesseract_image(self, _image, psm=7):
+        return self.ocr_region(None, psm=psm)
 
     def popup_active(self, log=False, context="popup"):
         return False
@@ -758,6 +762,93 @@ class BackendLogicTests(unittest.TestCase):
         self.assertFalse(any("Manual reroll flow | initial auto start fallback" in message for message in messages))
         self.assertTrue(any("result=failed_no_roll_detected" in message for message in messages))
 
+    def test_startup_strong_bad_spec_fast_probe_skips_full_validation(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot._begin_startup_context("unit startup")
+        calls = []
+
+        def fake_check_roll(allow_fallback=True, startup_fast=False, **_kwargs):
+            calls.append((allow_fallback, startup_fast))
+            if not startup_fast:
+                raise AssertionError("strong startup fast probe should skip full validation")
+            bot.last_decision_chain = {
+                "parsed_values": {
+                    "Combo Ramp": 17.5,
+                    "Damage": 17.4,
+                    "Crit Rate": 3.8,
+                    "Crit Damage": 7.13,
+                }
+            }
+            bot.last_ocr_candidate_debug = {"chosen_source": "unit-fast"}
+            return (
+                "BAD",
+                "rampage",
+                "Combo Ramp 17.5 | Damage 17.4 | Crit Rate 3.8 | Crit Damage 7.13",
+                "current spec rampage combo ramp 17.5 damage 17.4 crit chance 3.8 crit damage 7.13",
+                ["Damage: 17.4 -> 29-30", "Crit Damage: 7.13 -> 9-10"],
+                False,
+            )
+
+        bot.check_roll = fake_check_roll
+        bot.manual_reroll_flow = lambda reason="": True
+        bot._manual_reroll_recently_confirmed = lambda *_args, **_kwargs: True
+
+        result = bot.startup_check_current_roll()
+
+        self.assertEqual(result, "rerolled")
+        self.assertEqual(calls, [(False, True)])
+        self.assertTrue(any("startup_full_validation_skipped=True" in message for message in messages))
+        self.assertTrue(any("trusted_startup_fast_spec_probe" in message for message in messages))
+
+    def test_startup_non_target_bridge_probe_uses_single_compact_poll(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot._begin_startup_context("unit startup")
+        bot.popup_active = lambda *_args, **_kwargs: False
+        bot._popup_active_checked = lambda *_args, **_kwargs: False
+        stats_calls = []
+
+        def fake_check_roll(allow_fallback=True, startup_fast=False, **_kwargs):
+            if not startup_fast:
+                raise AssertionError("strong NON_TARGET fast probe should not run full validation")
+            return (
+                "NON_TARGET",
+                "non_target",
+                "Unsupported or filler observed; letting Auto continue",
+                "current spec swift damage 12 crit damage 5",
+                ["Unsupported trait autoskip"],
+                False,
+            )
+
+        def fake_stats_changed(baseline, context="Rolling activity", **kwargs):
+            stats_calls.append((baseline, context, kwargs))
+            bot.last_recovery_verify_state = "rolling"
+            bot.last_recovery_verify_details = {
+                "reason": "popup_confirmed_mid_polling",
+                "signal_sources": ["popup"],
+                "image_changed_samples": 0,
+                "max_change_score": 0.0,
+            }
+            bot.last_recovery_reason = "popup_confirmed_mid_polling"
+            return True, "current spec swift damage 13 crit damage 5"
+
+        bot.check_roll = fake_check_roll
+        bot.stats_changed = fake_stats_changed
+
+        result = bot.startup_check_current_roll()
+
+        self.assertEqual(result, "continue")
+        self.assertEqual(len(stats_calls), 1)
+        _baseline, context, kwargs = stats_calls[0]
+        self.assertEqual(context, "Startup fast NON_TARGET trust probe")
+        self.assertEqual(kwargs["polls_override"], 1)
+        self.assertEqual(kwargs["psm_sequence_override"], (6,))
+        self.assertTrue(bot._startup_context["preflight_bypassed"])
+        self.assertTrue(any("bridge probe confirmed rolling" in message for message in messages))
+
     def test_recovery_skips_checkbox_toggle_when_auto_already_enabled(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
@@ -929,6 +1020,8 @@ class BackendLogicTests(unittest.TestCase):
             ("ROLLING", "recovery"),
             ("GOD", "stop_state"),
             ("HIGH_VALUE", "stop_state"),
+            ("BAD", "stop_state"),
+            ("DISABLED", "stop_state"),
         ):
             with self.subTest(state=state, guard=guard):
                 messages = []
@@ -948,6 +1041,70 @@ class BackendLogicTests(unittest.TestCase):
 
                 self.assertEqual(result, "skipped")
                 self.assertEqual(clicks, [])
+
+    def test_watchdog_rejects_text_only_current_spec_marker_change_without_visual_or_number_change(self):
+        baseline = "current spec rampage combo ramp 16.8 damage 2.9 crit chance 3.85 crit damage 5.6"
+        sample = "current spec ge rampage comboramp 16.8 cap.damage 2.9 critchance 3.85 critdamage 5.6"
+        bot = ActivityStubBot([sample])
+        bot.cfg["AUTO_VERIFY_POLLS"] = 1
+        original_signal = bot._recovery_text_signal
+        bot._recovery_text_signal = lambda _raw, _baseline, _numbers: (
+            bot_module.normalize_text(sample),
+            "current_spec_marker_changed",
+        )
+
+        try:
+            changed, _text = bot.stats_changed(
+                baseline,
+                context="Unexpected No-Roll Watchdog suspicion",
+                ui_signals=["watchdog_stale_suspicion"],
+                polls_override=1,
+                poll_delay_override=0.0,
+                psm_sequence_override=(6,),
+                candidate_signal_enabled=False,
+                post_popup_check_enabled=False,
+                initial_popup_known_false=True,
+                initial_banner_known_false=True,
+                abandon_on_weak_samples=1,
+            )
+        finally:
+            bot._recovery_text_signal = original_signal
+
+        self.assertFalse(changed)
+        self.assertNotEqual(bot.last_recovery_reason, "current_spec_marker_changed")
+        self.assertTrue(any("rejected text-only watchdog activity" in message for message in bot.messages))
+
+    def test_watchdog_rejects_text_only_number_change_without_visual_change(self):
+        baseline = "current spec rampage combo ramp 17.5 damage 17.4 crit chance 3.8 crit damage 7.13"
+        sample = "current spec rampage combo ramp 17.5 damage 17.5 crit chance 3.8 crit damage 7.36"
+        bot = ActivityStubBot([sample])
+        bot.cfg["AUTO_VERIFY_POLLS"] = 1
+        original_signal = bot._recovery_text_signal
+        bot._recovery_text_signal = lambda _raw, _baseline, _numbers: (
+            bot_module.normalize_text(sample),
+            "stat_numbers_changed",
+        )
+
+        try:
+            changed, _text = bot.stats_changed(
+                baseline,
+                context="Unexpected No-Roll Watchdog suspicion",
+                ui_signals=["watchdog_stale_suspicion"],
+                polls_override=1,
+                poll_delay_override=0.0,
+                psm_sequence_override=(6,),
+                candidate_signal_enabled=False,
+                post_popup_check_enabled=False,
+                initial_popup_known_false=True,
+                initial_banner_known_false=True,
+                abandon_on_weak_samples=1,
+            )
+        finally:
+            bot._recovery_text_signal = original_signal
+
+        self.assertFalse(changed)
+        self.assertNotEqual(bot.last_recovery_reason, "stat_numbers_changed")
+        self.assertTrue(any("rejected text-only watchdog activity" in message for message in bot.messages))
 
     def test_unexpected_no_roll_watchdog_reenables_disabled_or_unknown_once(self):
         for checkbox_state in ("disabled", "unknown"):
@@ -1160,6 +1317,49 @@ class BackendLogicTests(unittest.TestCase):
         self.assertTrue(any("Startup fast current-spec check | state=BAD trait=Rampage" in message for message in messages))
         self.assertTrue(any("manual rerolling immediately" in message for message in messages))
         self.assertTrue(any("rolling confirmed" in message for message in messages))
+
+    def test_startup_strong_bad_spec_skips_weak_followup_validation(self):
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        reads = [
+            (
+                "BAD",
+                "rampage",
+                "Combo Ramp 24.7 | Damage 17.3 | Crit Rate 2.9 | Crit Damage 7.8",
+                "current spec rampage combo ramp 24.7 damage 17.3 crit chance 2.9 crit damage 7.8",
+                ["Combo Ramp: 24.7 -> 29-30", "Damage: 17.3 -> 29-30", "Crit Damage: 7.8 -> 9-10"],
+                False,
+            ),
+            (
+                "NON_TARGET",
+                "non_target",
+                "Unsupported/filler trait is safe to autoskip",
+                "currentspec. rampage comboramp 24.7 cap.datiage t730scatchance23ne.gadanige75",
+                ["Unsupported trait autoskip"],
+                False,
+            ),
+        ]
+        check_calls = []
+
+        def fake_check_roll(*args, **kwargs):
+            check_calls.append(kwargs)
+            return reads[min(len(check_calls) - 1, len(reads) - 1)]
+
+        bot.check_roll = fake_check_roll
+        manual_calls = []
+        bot.manual_reroll_flow = lambda reason="": manual_calls.append(reason) or True
+        bot.stats_changed = lambda *_args, **_kwargs: (
+            True,
+            "current spec rampage combo ramp 25 damage 18 crit chance 3 crit damage 8",
+        )
+
+        self.assertEqual(bot.startup_check_current_roll(), "rerolled")
+        self.assertEqual(manual_calls, ["startup current bad rampage"])
+        self.assertEqual(len(check_calls), 1)
+        self.assertTrue(any("startup_full_validation_skipped=True" in message for message in messages))
+        self.assertTrue(any("trusted_startup_fast_spec_probe" in message for message in messages))
+        self.assertTrue(any("manual rerolling immediately" in message for message in messages))
 
     def test_startup_disabled_current_spec_rerolls_immediately(self):
         messages = []
@@ -1383,6 +1583,134 @@ class BackendLogicTests(unittest.TestCase):
         self.assertGreaterEqual(popup_reads["count"], 2)
         self.assertFalse(any("popup not confirmed; pressing fallback Yes" in message for message in messages))
 
+    def test_manual_reroll_fast_visual_popup_path_skips_popup_ocr_and_resume_ocr(self):
+        if bot_module.Image is None:
+            self.skipTest("Pillow unavailable")
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot.auto_checkbox_state = lambda: "enabled"
+        self.force_strong_enabled_checkbox(bot)
+        clicks = []
+        bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
+        bot.stats_changed = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("visual refresh should skip resume OCR")
+        )
+        popup_ocr_reads = []
+        bot.ocr_region = lambda region, psm=7: popup_ocr_reads.append((tuple(region), psm)) or ""
+
+        dark = bot_module.Image.new("RGB", (80, 40), (12, 12, 12))
+        bright = bot_module.Image.new("RGB", (80, 40), (225, 225, 225))
+        mid = bot_module.Image.new("RGB", (80, 40), (80, 80, 80))
+        screenshots = iter([dark, dark, bright, dark, mid])
+
+        class VisualPyAutoGui:
+            @staticmethod
+            def screenshot(*_args, **_kwargs):
+                return next(screenshots)
+
+        old_pyautogui = bot_module.pyautogui
+        try:
+            bot_module.pyautogui = VisualPyAutoGui
+            self.assertTrue(bot.manual_reroll_flow("unit bad mythical"))
+        finally:
+            bot_module.pyautogui = old_pyautogui
+
+        self.assertEqual([call[0][1] for call in clicks], ["Manual Reroll", "Confirm Popup"])
+        self.assertEqual(popup_ocr_reads, [])
+        self.assertTrue(any("route=fast_visual" in message for message in messages))
+        self.assertTrue(any("visual roll refresh" in message for message in messages))
+
+    def test_manual_reroll_visual_resume_after_auto_click_still_runs_bounded_verify(self):
+        if bot_module.Image is None:
+            self.skipTest("Pillow unavailable")
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot.auto_checkbox_state = lambda: "disabled"
+        clicks = []
+        bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
+        verify_calls = []
+
+        def fake_stats_changed(baseline, context="", ui_signals=None, **_kwargs):
+            verify_calls.append((baseline, context, tuple(ui_signals or ())))
+            return True, "current spec rampage combo ramp 21 damage 22 crit chance 3 crit damage 7"
+
+        bot.stats_changed = fake_stats_changed
+        bot.ocr_region = lambda _region, psm=7: ""
+        dark = bot_module.Image.new("RGB", (80, 40), (12, 12, 12))
+        bright = bot_module.Image.new("RGB", (80, 40), (225, 225, 225))
+        mid = bot_module.Image.new("RGB", (80, 40), (80, 80, 80))
+        screenshots = iter([dark, dark, bright, dark, mid])
+
+        class VisualPyAutoGui:
+            @staticmethod
+            def screenshot(*_args, **_kwargs):
+                return next(screenshots)
+
+        old_pyautogui = bot_module.pyautogui
+        try:
+            bot_module.pyautogui = VisualPyAutoGui
+            self.assertTrue(bot.manual_reroll_flow("unit bad mythical"))
+        finally:
+            bot_module.pyautogui = old_pyautogui
+
+        self.assertEqual([call[0][1] for call in clicks], ["Manual Reroll", "Confirm Popup", "Manual Reroll Auto Resume"])
+        self.assertEqual(len(verify_calls), 1)
+        self.assertEqual(verify_calls[0][1], "Manual Reroll Auto Resume verify")
+        self.assertTrue(any("visual refresh observed after Auto click" in message for message in messages))
+
+    def test_manual_reroll_ambiguous_visual_popup_falls_back_to_ocr(self):
+        if bot_module.Image is None:
+            self.skipTest("Pillow unavailable")
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["POPUP_RETRY_DELAY"] = 0.0
+        bot.cfg["AUTO_VERIFY_DELAY"] = 0.0
+        bot._interruptible_sleep = lambda *_args, **_kwargs: True
+        bot.auto_checkbox_state = lambda: "enabled"
+        self.force_strong_enabled_checkbox(bot)
+        bot._ocr_tesseract_image = lambda *_args, **_kwargs: "current spec rampage combo ramp 21 damage 22"
+        bot.stats_changed = lambda baseline, context="", ui_signals=None, **_kwargs: (
+            context == "Manual Reroll Auto Resume verify"
+            and tuple(ui_signals or ()) == ("manual_reroll_auto_resume",),
+            "current spec rampage combo ramp 21 damage 22",
+        )
+        clicks = []
+        bot.click = lambda *args, **kwargs: clicks.append((args, kwargs))
+        popup_reads = {"count": 0}
+
+        def fake_ocr(region, psm=7):
+            if tuple(region) == tuple(bot.cfg["POPUP_REGION"]):
+                popup_reads["count"] += 1
+                return "are you sure you want to reroll" if popup_reads["count"] == 1 and psm == 7 else ""
+            return "current spec rampage combo ramp 21 damage 22"
+
+        bot.ocr_region = fake_ocr
+        same = bot_module.Image.new("RGB", (80, 40), (20, 20, 20))
+
+        class AmbiguousPyAutoGui:
+            @staticmethod
+            def screenshot(*_args, **_kwargs):
+                return same
+
+        old_pyautogui = bot_module.pyautogui
+        try:
+            bot_module.pyautogui = AmbiguousPyAutoGui
+            self.assertTrue(bot.manual_reroll_flow("unit bad mythical"))
+        finally:
+            bot_module.pyautogui = old_pyautogui
+
+        self.assertGreaterEqual(popup_reads["count"], 1)
+        self.assertIn("Confirm Popup", [call[0][1] for call in clicks])
+        self.assertTrue(any("visual fallback" in message for message in messages))
+        self.assertTrue(any("route=ocr_fallback" in message for message in messages))
+
     def test_manual_reroll_auto_resume_uncertain_uses_bounded_recovery_path(self):
         messages = []
         bot = AelrithForgeBot(messages.append, lambda *_: None)
@@ -1508,6 +1836,7 @@ class BackendLogicTests(unittest.TestCase):
         bot._interruptible_sleep = lambda *_args, **_kwargs: True
         bot.popup_active = lambda *_args, **_kwargs: True
         bot.clear_reroll_popup = lambda *_args, **_kwargs: True
+        bot._safe_region_screenshot = lambda *_args, **_kwargs: None
         bot.auto_checkbox_state = lambda: "enabled"
         self.force_strong_enabled_checkbox(bot)
         bot.click = lambda *_args, **_kwargs: None
@@ -1695,7 +2024,9 @@ class BackendLogicTests(unittest.TestCase):
             )
 
             self.assertTrue(bot.manual_reroll_flow("bad power cursebrand"))
-            self.assertEqual([entry[1] for entry in clicks], ["Manual Reroll", "Confirm Reroll", "Manual Reroll Auto Resume"])
+            self.assertEqual(clicks[0][1], "Manual Reroll")
+            self.assertIn(clicks[1][1], ("Confirm Reroll", "Confirm Popup"))
+            self.assertEqual(clicks[2][1], "Manual Reroll Auto Resume")
             self.assertEqual([entry[0] for entry in clicks], [(303, 404), (505, 606), (101, 202)])
 
     def test_powers_manual_reroll_logs_use_power_wording(self):
@@ -2642,7 +2973,7 @@ class BackendLogicTests(unittest.TestCase):
         bot.loop()
 
         self.assertGreaterEqual(len(check_calls), 2)
-        self.assertEqual(check_calls[1], {"allow_fallback": False, "startup_fast": True})
+        self.assertEqual(check_calls[1], {"allow_fallback": False, "startup_fast": False})
         self.assertTrue(any("Loop Power BAD manual reroll confirmed | route=fast_power_probe" in message for message in messages))
 
     def test_weak_power_bad_chain_does_not_use_fast_confirmation(self):
@@ -3124,6 +3455,16 @@ class BackendLogicTests(unittest.TestCase):
         )
         self.assertEqual(values, [22.6, 19.1, 3.0, 6.8])
 
+    def test_rampage_parser_rejects_orphan_damage_debris_between_labels(self):
+        bot = self.make_bot()
+        values, debug = bot.extract_labeled_values(
+            "rampage",
+            "currentspec. -rampage comboramp 17.5 cap.damage r1bmcaitchance38.gtdakige736",
+            return_debug=True,
+        )
+        self.assertEqual(values, [17.5, None, 3.8, 7.36])
+        self.assertTrue(any("ignored orphan OCR debris" in item for item in debug["detected_labels"]))
+
     def test_extracts_passive_shard_count(self):
         bot = self.make_bot()
         self.assertEqual(bot.extract_passive_shards("Passive Shards: 1,240"), 1240)
@@ -3512,6 +3853,9 @@ class BackendLogicTests(unittest.TestCase):
 
     def test_version_matches_shared_metadata(self):
         self.assertEqual(APP_VERSION, VERSION_METADATA)
+        self.assertEqual(APP_PUBLIC_VERSION, PUBLIC_VERSION_METADATA)
+        self.assertEqual(APP_PUBLIC_VERSION, "v1.2")
+        self.assertEqual(APP_DISPLAY_NAME, f"Kon. {APP_PUBLIC_VERSION}")
 
     def test_webhook_deletes_uploaded_screenshot(self):
         class Response:
@@ -3869,6 +4213,155 @@ class BackendLogicTests(unittest.TestCase):
         self.assertTrue(bot.calls[0].get("fast_loop"))
         self.assertFalse(bot.calls[1].get("fast_loop", False))
         self.assertFalse(bot.calls[1].get("fallback_only", False))
+
+    def test_specs_fast_loop_infers_bad_rampage_from_stat_structure_before_autoskip(self):
+        bot = FastLoopCandidateBot(
+            [
+                (
+                    "tesseract-full-original-psm6",
+                    "current-spec. ge combo 16.8 cap.damage 2.9 critchance 3.85 critdamage 5.6",
+                    "CURRENT-SPEC. ge Combo 16.8 cap.Damage 2.9 CritChance 3.85 CritDamage 5.6",
+                )
+            ],
+            primary_candidates=[
+                (
+                    "tesseract-full-original-psm6",
+                    "current spec phantom guard damage 5.0 range 3.0",
+                    "CURRENT SPEC Phantom Guard Damage 5.0 Range 3.0",
+                )
+            ],
+        )
+
+        state, trait, summary, _text, missing, near = bot.check_roll()
+
+        self.assertEqual(state, "BAD")
+        self.assertEqual(trait, "rampage")
+        self.assertIn("Combo Ramp", summary)
+        self.assertIn("Damage", " ; ".join(missing))
+        self.assertFalse(near)
+        self.assertEqual(len(bot.calls), 1)
+        self.assertFalse(any("cached_non_target" in message for message in bot.messages))
+        self.assertTrue(any("Possible target mythical stat structure detected" in message for message in bot.messages))
+
+    def test_logged_aterany_rampage_ocr_classifies_bad_instead_of_non_target(self):
+        bot = FastLoopCandidateBot(
+            [
+                (
+                    "tesseract-full-original-psm6",
+                    "current-spec. ae aterany 17.5 cap.damage 17.4 ert chanice3.8 eit dantige 713",
+                    "CURRENT-SPEC. ae Aterany 17.5 cap.Damage 17.4 ert chanice3.8 eit dantige 713",
+                )
+            ]
+        )
+
+        state, trait, summary, _text, missing, near = bot.check_roll()
+
+        self.assertEqual(state, "BAD")
+        self.assertEqual(trait, "rampage")
+        self.assertIn("Combo Ramp 17.5", summary)
+        self.assertIn("Crit Damage 7.13", summary)
+        self.assertIn("Damage", " ; ".join(missing))
+        self.assertFalse(near)
+        self.assertFalse(any("unsupported_trait_autoskip" in message for message in bot.messages))
+
+    def test_logged_noisy_rampage_marker_change_classifies_bad_instead_of_non_target(self):
+        bot = FastLoopCandidateBot(
+            [
+                (
+                    "tesseract-full-original-psm6",
+                    "currentspec. -rampage comboramp 17.5 cap.damage r1bmcaitchance38.gtdakige736",
+                    "CurrentSpec. -Rampage ComboRamp 17.5 cap.Damage r1bmcaitchance38.gtdakige736",
+                )
+            ]
+        )
+
+        state, trait, summary, _text, missing, near = bot.check_roll()
+
+        self.assertEqual(state, "BAD")
+        self.assertEqual(trait, "rampage")
+        self.assertIn("Combo Ramp 17.5", summary)
+        self.assertIn("Damage ?", summary)
+        self.assertNotIn("Damage 1", summary)
+        self.assertIn("Crit Damage 7.36", summary)
+        self.assertIn("Damage", " ; ".join(missing))
+        self.assertFalse(near)
+        self.assertFalse(any("cached_non_target" in message for message in bot.messages))
+
+    def test_stats_ocr_early_stops_after_one_strong_spec_read(self):
+        if bot_module.Image is None:
+            self.skipTest("Pillow unavailable")
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["OCR_DEBUG_VERBOSE"] = False
+        calls = []
+        texts = [
+            "CURRENT SPEC Rampage Combo Ramp 24.7 Damage 17.3 Crit Rate 2.9 Crit Damage 7.8",
+            "SHOULD NOT READ SECOND PASS",
+            "SHOULD NOT READ THIRD PASS",
+        ]
+
+        def fake_ocr(_img, psm=6):
+            calls.append(psm)
+            return texts[len(calls) - 1]
+
+        class FakePyAutoGui:
+            @staticmethod
+            def screenshot(*_args, **_kwargs):
+                return bot_module.Image.new("RGB", (180, 80), (20, 20, 20))
+
+        old_pyautogui = bot_module.pyautogui
+        old_pytesseract = bot_module.pytesseract
+        try:
+            bot_module.pyautogui = FakePyAutoGui
+            bot_module.pytesseract = object()
+            bot._ocr_tesseract_image = fake_ocr
+            candidates = bot.get_stats_ocr_candidates(startup_fast=True)
+        finally:
+            bot_module.pyautogui = old_pyautogui
+            bot_module.pytesseract = old_pytesseract
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(any("OCR early stop" in message for message in messages))
+
+    def test_stats_ocr_early_stops_after_second_read_when_first_is_partial(self):
+        if bot_module.Image is None:
+            self.skipTest("Pillow unavailable")
+        messages = []
+        bot = AelrithForgeBot(messages.append, lambda *_: None)
+        bot.cfg["OCR_DEBUG_FILE"] = False
+        bot.cfg["OCR_DEBUG_VERBOSE"] = False
+        calls = []
+        texts = [
+            "CURRENT SPEC Rampage Damage 17.3",
+            "CURRENT SPEC Rampage Combo Ramp 24.7 Damage 17.3 Crit Rate 2.9 Crit Damage 7.8",
+            "SHOULD NOT READ THIRD PASS",
+        ]
+
+        def fake_ocr(_img, psm=6):
+            calls.append(psm)
+            return texts[len(calls) - 1]
+
+        class FakePyAutoGui:
+            @staticmethod
+            def screenshot(*_args, **_kwargs):
+                return bot_module.Image.new("RGB", (180, 80), (20, 20, 20))
+
+        old_pyautogui = bot_module.pyautogui
+        old_pytesseract = bot_module.pytesseract
+        try:
+            bot_module.pyautogui = FakePyAutoGui
+            bot_module.pytesseract = object()
+            bot._ocr_tesseract_image = fake_ocr
+            candidates = bot.get_stats_ocr_candidates(startup_fast=True)
+        finally:
+            bot_module.pyautogui = old_pyautogui
+            bot_module.pytesseract = old_pytesseract
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(candidates), 2)
+        self.assertTrue(any("reads=2" in message for message in messages if "OCR early stop" in message))
 
     def test_specs_fast_loop_caches_repeated_non_target_without_fallback(self):
         bot = FastLoopCandidateBot(

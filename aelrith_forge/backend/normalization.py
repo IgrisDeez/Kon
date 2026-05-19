@@ -52,6 +52,8 @@ STAT_ALIASES = {
         "ccrit chance",
         "crit oance",
         "crit cance",
+        "ert chanice",
+        "bmcaitchance",
         "crit chanoe",
         "crit chanee",
         "crit rata",
@@ -82,6 +84,8 @@ STAT_ALIASES = {
         "gait damage",
         "gaitdamage",
         "qit damage",
+        "eit dantige",
+        "gtdakige",
         "critical damage",
     ],
     "drop": [

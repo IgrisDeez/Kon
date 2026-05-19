@@ -94,6 +94,9 @@ class TraceReplayBot(AelrithForgeBot):
     def popup_active(self, log=False, context="popup", fast=False):
         return bool(self._next_fixture_item("popup_states", "popup_state_index", False))
 
+    def _safe_region_screenshot(self, region):
+        return None
+
     def banner_active(self):
         return bool(self._next_fixture_item("banner_states", "banner_state_index", False))
 

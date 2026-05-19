@@ -1,5 +1,50 @@
 # Changelog
 
+## v1.101.9
+
+- Allowed stale `NON_TARGET` watchdog recovery to send one bounded Auto re-click when the roll panel is visible and the activity guard proves rolling stopped.
+- Reused strong startup fast-probe BAD/DISABLED Spec reads to skip duplicate current-spec validation and reduce startup delay.
+
+## v1.101.8
+
+- Rejected orphan OCR debris such as `r1` after Rampage `Damage` labels so noisy reads no longer display fake low damage values.
+- Kept BAD Rampage classification intact while showing uncertain damaged stats as missing instead of invented values.
+
+## v1.101.7
+
+- Improved noisy Rampage OCR handling so malformed BAD current-spec reads are classified as Rampage instead of safe filler.
+- Tightened watchdog resume proof so text-only OCR changes on a frozen panel no longer count as healthy rolling.
+
+## v1.101.6
+
+- Added `APP_PUBLIC_VERSION` so the app can display `Kon. v1.2` while keeping the internal updater/build version monotonic.
+
+## v1.101.5
+
+- Prevented weak Rampage-style current-spec OCR from being cached as safe filler when it matches listed Mythical stat structure.
+- Tightened post-reroll and watchdog resume proof so text-only stale-panel changes cannot masquerade as healthy rolling.
+
+## v1.101.4
+
+- Added parser-aware OCR early stopping so strong complete Specs/Powers reads can confirm after the first or second Tesseract pass.
+- Kept the full OCR fallback path for partial, weak, markerless, or incoherent reads to preserve accuracy.
+
+## v1.101.3
+
+- Optimized manual reroll popup handling with a fast visual confirm/clear path before falling back to popup OCR.
+- Added visual roll-refresh confirmation after popup-cleared Auto resume to avoid extra OCR on the common successful reroll path.
+- Added detailed manual reroll timing logs for popup route, Auto checkbox, resume verify, and total elapsed time.
+
+## v1.101.2
+
+- Fixed startup Specs handling so a strong first BAD/DISABLED listed Mythical is not downgraded by a weak unreadable/non-target follow-up OCR read.
+- Preserved the startup Auto-toggle safety guard while routing confirmed startup BAD Specs into manual reroll.
+
+## v1.101.1
+
+- Sped up Power BAD confirmation during normal rolling by using the one-pass loop OCR profile instead of the startup multi-pass profile.
+- Kept startup Power BAD confirmation on the safer startup OCR profile and added clearer logs showing which profile was used.
+
 ## v1.101
 
 - Added GitHub Release update checks for portable Kon. builds with a user-approved install prompt.

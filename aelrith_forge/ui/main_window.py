@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import APP_BRAND_NAME, APP_CONSOLE_LABEL, APP_DISPLAY_NAME, APP_VERSION
+from .. import APP_BRAND_NAME, APP_CONSOLE_LABEL, APP_DISPLAY_NAME, APP_PUBLIC_VERSION
 from ..backend.bot import STAT_CAPS, STAT_LABELS
 from ..backend import updater
 from ..backend.powers import POWER_DEFAULT_RULES, SUPPORTED_POWER_DEFINITIONS
@@ -90,7 +90,7 @@ class MainWindow(QMainWindow):
         title_box.setSpacing(2)
         app_title = label(APP_BRAND_NAME, "heroTitle")
         app_console = label(APP_CONSOLE_LABEL, "subtitle")
-        app_version = label(APP_VERSION, "tiny")
+        app_version = label(APP_PUBLIC_VERSION, "tiny")
         title_box.addWidget(app_title)
         title_box.addWidget(app_console)
         title_box.addWidget(app_version)
@@ -172,7 +172,7 @@ class MainWindow(QMainWindow):
         self.nav_buttons[0].setChecked(True)
         layout.addStretch(1)
 
-        footer = QLabel(f"Copyright © 2026 Igers. All rights reserved.\n{APP_CONSOLE_LABEL} · {APP_VERSION}")
+        footer = QLabel(f"Copyright © 2026 Igers. All rights reserved.\n{APP_CONSOLE_LABEL} · {APP_PUBLIC_VERSION}")
         footer.setProperty("container", True)
         footer.setProperty("role", "tiny")
         footer.setWordWrap(True)
